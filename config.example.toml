@@ -1,0 +1,65 @@
+[mysql]
+url = "mysql://sync_user:sync_password@127.0.0.1:3306/football_data"
+server_id = 7101
+
+[meilisearch]
+host = "http://127.0.0.1:7700"
+api_key = "masterKey"
+batch_size = 50000
+max_in_flight_tasks = 4
+task_poll_ms = 100
+task_timeout_secs = 600
+
+[runtime]
+state_path = "meili-sync-state.json"
+snapshot_on_start = true
+flush_interval_ms = 1000
+checkpoint_every_events = 1000
+
+[[tables]]
+table = "clubs"
+index = "clubs"
+primary_key = "club_id"
+fields = [
+  "club_id",
+  "club_code",
+  "name",
+  "domestic_competition_id",
+  "total_market_value",
+  "squad_size",
+  "average_age",
+  "foreigners_number",
+  "foreigners_percentage",
+  "national_team_players",
+  "stadium_name",
+  "stadium_seats",
+  "net_transfer_record",
+  "coach_name",
+  "last_season",
+  "url",
+  "is_stub",
+]
+displayed_attributes = [
+  "club_id",
+  "club_code",
+  "name",
+  "domestic_competition_id",
+  "total_market_value",
+  "squad_size",
+  "average_age",
+  "foreigners_number",
+  "foreigners_percentage",
+  "national_team_players",
+  "stadium_name",
+  "stadium_seats",
+  "net_transfer_record",
+  "coach_name",
+  "last_season",
+  "url",
+  "is_stub",
+]
+searchable_attributes = ["name", "club_code"]
+filterable_attributes = ["domestic_competition_id", "last_season", "is_stub"]
+sortable_attributes = ["name", "total_market_value", "squad_size", "average_age", "stadium_seats", "last_season"]
+ranking_rules = ["words", "typo", "proximity", "attribute", "sort", "exactness"]
+snapshot_batch_size = 50000
