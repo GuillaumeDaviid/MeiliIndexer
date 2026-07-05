@@ -82,4 +82,43 @@ mod tests {
             JsonValue::String("2026-06-28T17:08:09.000042".to_owned())
         );
     }
+
+    #[test]
+    fn converts_scalar_values_to_json() {
+        assert_eq!(mysql_value_to_json(&MySqlValue::NULL), JsonValue::Null);
+        assert_eq!(
+            mysql_value_to_json(&MySqlValue::Int(-12)),
+            JsonValue::from(-12)
+        );
+        assert_eq!(
+            mysql_value_to_json(&MySqlValue::UInt(12)),
+            JsonValue::from(12_u64)
+        );
+        assert_eq!(
+            mysql_value_to_json(&MySqlValue::Bytes(b"SKU-42".to_vec())),
+            JsonValue::String("SKU-42".to_owned())
+        );
+    }
+
+    #[test]
+    fn formats_time_with_days_and_microseconds() {
+        let value = MySqlValue::Time(true, 2, 3, 4, 5, 6);
+
+        assert_eq!(
+            mysql_value_to_json(&value),
+            JsonValue::String("-51:04:05.000006".to_owned())
+        );
+        assert_eq!(mysql_value_to_document_id(&value), "-51:04:05.000006");
+    }
+
+    #[test]
+    fn converts_values_to_document_ids() {
+        assert_eq!(mysql_value_to_document_id(&MySqlValue::NULL), "");
+        assert_eq!(
+            mysql_value_to_document_id(&MySqlValue::Bytes(b"SKU-42".to_vec())),
+            "SKU-42"
+        );
+        assert_eq!(mysql_value_to_document_id(&MySqlValue::Int(-12)), "-12");
+        assert_eq!(mysql_value_to_document_id(&MySqlValue::UInt(12)), "12");
+    }
 }

@@ -281,3 +281,132 @@ impl TableConfig {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_table() -> TableConfig {
+        TableConfig {
+            table: "products".to_owned(),
+            index: "products".to_owned(),
+            primary_key: "id".to_owned(),
+            fields: vec!["id".to_owned(), "name".to_owned()],
+            ..TableConfig::default()
+        }
+    }
+
+    fn config_with_tables(tables: Vec<TableConfig>) -> Config {
+        Config {
+            mysql: MysqlConfig {
+                url: "mysql://user:password@localhost/shop".to_owned(),
+                server_id: 42,
+            },
+            meilisearch: MeilisearchConfig {
+                host: "http://localhost:7700".to_owned(),
+                ..MeilisearchConfig::default()
+            },
+            runtime: RuntimeConfig::default(),
+            tables,
+        }
+    }
+
+    #[test]
+    fn toml_deserialization_applies_defaults_and_validates() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+                [mysql]
+                url = "mysql://user:password@localhost/shop"
+                server_id = 42
+
+                [meilisearch]
+                host = "http://localhost:7700"
+
+                [[tables]]
+                table = "products"
+                index = "products"
+                primary_key = "id"
+                fields = ["id", "name"]
+            "#,
+        )?;
+
+        config.validate()?;
+
+        assert_eq!(
+            config.runtime.state_path,
+            std::path::PathBuf::from("meili-sync-state.json")
+        );
+        assert!(config.runtime.snapshot_on_start);
+        assert_eq!(config.meilisearch.batch_size, 1_000);
+        assert_eq!(config.meilisearch.max_in_flight_tasks, 8);
+        assert_eq!(config.tables[0].snapshot_batch_size, 10_000);
+        Ok(())
+    }
+
+    #[test]
+    fn document_fields_apply_aliases_in_source_order() {
+        let mut table = valid_table();
+        table
+            .field_aliases
+            .insert("name".to_owned(), "display_name".to_owned());
+
+        assert_eq!(table.target_field("name"), "display_name");
+        assert_eq!(table.target_field("unknown"), "unknown");
+        assert_eq!(
+            table.document_fields(),
+            vec!["id".to_owned(), "display_name".to_owned()]
+        );
+    }
+
+    #[test]
+    fn validate_accepts_attributes_after_aliasing() -> Result<()> {
+        let mut table = valid_table();
+        table
+            .field_aliases
+            .insert("name".to_owned(), "display_name".to_owned());
+        table.displayed_attributes = Some(vec!["id".to_owned(), "display_name".to_owned()]);
+        table.searchable_attributes = Some(vec!["display_name".to_owned()]);
+        table.distinct_attribute = Some("display_name".to_owned());
+
+        config_with_tables(vec![table]).validate()
+    }
+
+    #[test]
+    fn validate_rejects_attribute_not_present_in_document() {
+        let mut table = valid_table();
+        table
+            .field_aliases
+            .insert("name".to_owned(), "display_name".to_owned());
+        table.filterable_attributes = Some(vec!["name".to_owned()]);
+
+        let error = config_with_tables(vec![table])
+            .validate()
+            .expect_err("attribute should be rejected when the source name is aliased");
+
+        assert!(error.to_string().contains("absent des champs du document"));
+    }
+
+    #[test]
+    fn validate_rejects_primary_key_missing_from_fields() {
+        let mut table = valid_table();
+        table.fields = vec!["name".to_owned()];
+
+        let error = config_with_tables(vec![table])
+            .validate()
+            .expect_err("primary key must be part of fields");
+
+        assert!(error.to_string().contains("doit etre presente"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_table_index_mapping() {
+        let first = valid_table();
+        let second = valid_table();
+
+        let error = config_with_tables(vec![first, second])
+            .validate()
+            .expect_err("duplicate table/index mapping should be rejected");
+
+        assert!(error.to_string().contains("table dupliquee"));
+    }
+}
