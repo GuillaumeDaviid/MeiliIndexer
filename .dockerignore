@@ -1,0 +1,14 @@
+target/
+.git/
+.agents/
+.codex/
+.rust-skills/
+
+config.toml
+meili-sync-state.json
+
+Dockerfile
+.dockerignore
+
+*.log
+*.tmp
