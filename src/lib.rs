@@ -4,6 +4,7 @@
 pub mod cdc;
 pub mod config;
 pub mod meili;
+pub mod metrics;
 pub mod mysql;
 pub mod state;
 pub mod value;

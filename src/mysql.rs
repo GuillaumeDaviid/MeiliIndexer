@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     convert::TryFrom,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +20,7 @@ use tracing::info;
 use crate::{
     config::{Config, TableConfig},
     meili::{IndexPreparation, MeiliSink},
+    metrics::SyncMetrics,
     state::BinlogPosition,
     value::{mysql_value_to_document_id, mysql_value_to_json},
 };
@@ -269,16 +271,22 @@ pub async fn run_snapshot(
     plans: &[TablePlan],
     sink: &mut MeiliSink,
     index_preparation: IndexPreparation,
+    metrics: Option<&SyncMetrics>,
 ) -> Result<()> {
     for plan in plans {
         sink.prepare_index(&plan.config, index_preparation).await?;
-        snapshot_table(pool, plan, sink).await?;
+        snapshot_table(pool, plan, sink, metrics).await?;
     }
     sink.flush_all().await?;
     sink.wait_all().await
 }
 
-async fn snapshot_table(pool: &Pool, plan: &TablePlan, sink: &mut MeiliSink) -> Result<()> {
+async fn snapshot_table(
+    pool: &Pool,
+    plan: &TablePlan,
+    sink: &mut MeiliSink,
+    metrics: Option<&SyncMetrics>,
+) -> Result<()> {
     info!(
         table = %plan.key.table,
         database = %plan.key.database,
@@ -309,16 +317,31 @@ async fn snapshot_table(pool: &Pool, plan: &TablePlan, sink: &mut MeiliSink) -> 
         let params = last_pk
             .clone()
             .map_or(Params::Empty, |value| Params::Positional(vec![value]));
-        let mut result = conn
-            .exec_iter(query, params)
-            .await
-            .with_context(|| format!("requete snapshot {}", plan.key.table))?;
+        let started_at = Instant::now();
+        let result = conn.exec_iter(query, params).await;
+        if let Some(metrics) = metrics {
+            metrics.record_mysql_read(started_at.elapsed());
+        }
+        let mut result = result.with_context(|| format!("requete snapshot {}", plan.key.table))?;
 
         let mut rows_in_batch = 0_usize;
-        while let Some(row) = result.next().await? {
+        loop {
+            let started_at = Instant::now();
+            let next = result.next().await;
+            if let Some(metrics) = metrics {
+                metrics.record_mysql_read(started_at.elapsed());
+            }
+            let Some(row) = next? else {
+                break;
+            };
             let pk = plan.row_primary_key(&row)?;
             let document_id = mysql_value_to_document_id(&pk);
+            let started_at = Instant::now();
             let document = plan.row_to_document(&row)?;
+            if let Some(metrics) = metrics {
+                metrics.record_transformation(started_at.elapsed());
+                metrics.record_document_read(&document);
+            }
             info!(
                 sync_mode = "snapshot",
                 source_database = %plan.key.database,
@@ -373,21 +396,35 @@ pub async fn fetch_document_by_pk(
     pool: &Pool,
     plan: &TablePlan,
     primary_key: &MySqlValue,
+    metrics: Option<&SyncMetrics>,
 ) -> Result<Option<JsonValue>> {
     let mut conn = pool
         .get_conn()
         .await
         .with_context(|| format!("connexion MySQL pour relire {}", plan.key.table))?;
-    let row = conn
+    let started_at = Instant::now();
+    let result = conn
         .exec_first::<Row, _, _>(
             plan.fetch_query(),
             Params::Positional(vec![primary_key.clone()]),
         )
-        .await
-        .with_context(|| format!("relecture de {}", plan.key.table))?;
-    row.as_ref()
+        .await;
+    if let Some(metrics) = metrics {
+        metrics.record_mysql_read(started_at.elapsed());
+    }
+    let row = result.with_context(|| format!("relecture de {}", plan.key.table))?;
+    let started_at = Instant::now();
+    let document = row
+        .as_ref()
         .map(|row| plan.row_to_document(row))
-        .transpose()
+        .transpose()?;
+    if let Some(metrics) = metrics {
+        metrics.record_transformation(started_at.elapsed());
+        if let Some(document) = &document {
+            metrics.record_document_read(document);
+        }
+    }
+    Ok(document)
 }
 
 pub fn operation_from_rows(

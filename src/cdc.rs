@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::{
     Config,
     meili::{MeiliSink, SyncOperation},
+    metrics::SyncMetrics,
     mysql::{
         RowOperation, TablePlan, fetch_document_by_pk, find_plan_for_table, operation_from_rows,
         rows_event_rows,
@@ -26,6 +27,7 @@ pub async fn run(
     plans: &[TablePlan],
     sink: &mut MeiliSink,
     start: BinlogPosition,
+    metrics: Option<&SyncMetrics>,
 ) -> Result<()> {
     let opts = Opts::from_url(&config.mysql.url).context("parsing de mysql.url")?;
     let conn = Conn::new(opts)
@@ -42,6 +44,7 @@ pub async fn run(
 
     let mut latest_position = start;
     let mut events_since_checkpoint = 0_u64;
+    let mut events_since_metrics = 0_u64;
     let mut flush_timer = interval(Duration::from_millis(config.runtime.flush_interval_ms));
     flush_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -57,19 +60,23 @@ pub async fn run(
             signal = tokio::signal::ctrl_c() => {
                 signal.context("attente du signal Ctrl+C")?;
                 info!("arret demande, flush des operations CDC en attente");
-                checkpoint(sink, &config.runtime.state_path, &latest_position).await?;
+                checkpoint(sink, &config.runtime.state_path, &latest_position, metrics).await?;
                 stream.close().await.context("fermeture du flux binlog")?;
                 return Ok(());
             }
             _ = flush_timer.tick() => {
                 if sink.pending_operations() > 0 {
-                    checkpoint(sink, &config.runtime.state_path, &latest_position).await?;
+                    checkpoint(sink, &config.runtime.state_path, &latest_position, metrics).await?;
+                }
+                if events_since_metrics > 0 {
+                    report_progress(metrics);
+                    events_since_metrics = 0;
                 }
             }
             event = stream.next() => {
                 let Some(event) = event else {
                     warn!("flux binlog termine par le serveur");
-                    checkpoint(sink, &config.runtime.state_path, &latest_position).await?;
+                    checkpoint(sink, &config.runtime.state_path, &latest_position, metrics).await?;
                     return Ok(());
                 };
                 let event = event.context("lecture d'un evenement binlog")?;
@@ -83,19 +90,28 @@ pub async fn run(
                         latest_position.pos = rotate.position();
                     }
                     if let EventData::RowsEvent(rows_event) = data {
-                        process_rows_event(pool, plans, sink, &stream, rows_event, &event_id).await?;
+                        process_rows_event(pool, plans, sink, &stream, rows_event, &event_id, metrics).await?;
                     }
                 }
 
                 events_since_checkpoint = events_since_checkpoint.saturating_add(1);
+                events_since_metrics = events_since_metrics.saturating_add(1);
                 if sink.pending_operations() >= config.meilisearch.batch_size
                     || events_since_checkpoint >= config.runtime.checkpoint_every_events
                 {
-                    checkpoint(sink, &config.runtime.state_path, &latest_position).await?;
+                    checkpoint(sink, &config.runtime.state_path, &latest_position, metrics).await?;
                     events_since_checkpoint = 0;
+                    report_progress(metrics);
+                    events_since_metrics = 0;
                 }
             }
         }
+    }
+}
+
+fn report_progress(metrics: Option<&SyncMetrics>) {
+    if let Some(metrics) = metrics {
+        metrics.report_progress();
     }
 }
 
@@ -106,6 +122,7 @@ async fn process_rows_event(
     stream: &mysql_async::BinlogStream,
     rows_event: RowsEventData<'_>,
     event_id: &str,
+    metrics: Option<&SyncMetrics>,
 ) -> Result<()> {
     let table_id = rows_event.table_id();
     let Some(table_map_event) = stream.get_tme(table_id) else {
@@ -123,8 +140,12 @@ async fn process_rows_event(
 
     for row in rows_event_rows(&rows_event, table_map_event) {
         let (before, after) = row?;
+        let started_at = Instant::now();
         let operation = operation_from_rows(plan, before.as_ref(), after.as_ref())?;
-        queue_row_operation(pool, plan, sink, operation, event_id).await?;
+        if let Some(metrics) = metrics {
+            metrics.record_transformation(started_at.elapsed());
+        }
+        queue_row_operation(pool, plan, sink, operation, event_id, metrics).await?;
     }
 
     Ok(())
@@ -136,6 +157,7 @@ async fn queue_row_operation(
     sink: &mut MeiliSink,
     operation: RowOperation,
     event_id: &str,
+    metrics: Option<&SyncMetrics>,
 ) -> Result<()> {
     match operation {
         RowOperation::Ignored => Ok(()),
@@ -174,11 +196,16 @@ async fn queue_row_operation(
             }
 
             let document = if needs_fetch {
-                fetch_document_by_pk(pool, plan, &primary_key).await?
+                fetch_document_by_pk(pool, plan, &primary_key, metrics).await?
             } else {
                 document
             };
             if let Some(document) = document {
+                if !needs_fetch {
+                    if let Some(metrics) = metrics {
+                        metrics.record_document_read(&document);
+                    }
+                }
                 queue_upsert(sink, plan, document_id, document, needs_fetch, event_id).await
             } else {
                 queue_delete(
@@ -268,11 +295,16 @@ async fn checkpoint(
     sink: &mut MeiliSink,
     state_path: &std::path::Path,
     position: &BinlogPosition,
+    metrics: Option<&SyncMetrics>,
 ) -> Result<()> {
     sink.flush_all().await?;
     sink.wait_all().await?;
-    save_state(state_path, &State::new(position.clone()))
-        .with_context(|| format!("checkpoint binlog {}:{}", position.file, position.pos))
+    let started_at = Instant::now();
+    let result = save_state(state_path, &State::new(position.clone()));
+    if let Some(metrics) = metrics {
+        metrics.record_checkpoint_write(started_at.elapsed());
+    }
+    result.with_context(|| format!("checkpoint binlog {}:{}", position.file, position.pos))
 }
 
 fn update_position_from_header(

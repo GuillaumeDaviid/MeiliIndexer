@@ -1,15 +1,17 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use meili_mysql_sync::{
     Config, cdc,
     meili::{IndexPreparation, MeiliSink},
+    metrics::{SyncMetrics, SyncMode},
     mysql::{create_pool, current_binlog_position, load_table_plans, run_snapshot},
     state::{BinlogPosition, State, absolutize, load as load_state, save as save_state},
 };
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
+use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,6 +21,12 @@ use tracing_subscriber::{EnvFilter, fmt};
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
     config: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        help = "Affiche les metriques de performance a la fin"
+    )]
+    metrics: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -49,6 +57,7 @@ enum Command {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
@@ -57,64 +66,110 @@ async fn main() -> Result<()> {
     let pool = create_pool(&config)?;
     let plans = load_table_plans(&config, &pool).await?;
 
-    match cli.command.unwrap_or(Command::Run {
+    let command = cli.command.unwrap_or(Command::Run {
         force_snapshot: false,
         recreate_indexes: false,
         clear_documents: false,
-    }) {
-        Command::Run {
-            force_snapshot,
-            recreate_indexes,
-            clear_documents,
-        } => {
-            let mut sink = MeiliSink::new(&config.meilisearch)?;
-            let state = load_state(&state_path)?;
-            let start = if state.is_none() || force_snapshot {
-                let position = current_binlog_position(&pool).await?;
-                if config.runtime.snapshot_on_start || force_snapshot {
-                    let index_preparation = IndexPreparation {
-                        recreate: recreate_indexes,
-                        clear_documents,
-                    };
-                    run_snapshot(&pool, &plans, &mut sink, index_preparation).await?;
-                }
-                save_state(&state_path, &State::new(position.clone()))?;
-                position
-            } else {
-                state.context("etat absent")?.binlog
-            };
-            cdc::run(&config, &pool, &plans, &mut sink, start).await?;
-        }
-        Command::Snapshot {
-            recreate_indexes,
-            clear_documents,
-        } => {
-            let mut sink = MeiliSink::new(&config.meilisearch)?;
-            let index_preparation = IndexPreparation {
-                recreate: recreate_indexes,
-                clear_documents,
-            };
-            run_snapshot(&pool, &plans, &mut sink, index_preparation).await?;
-        }
-        Command::Cdc { file, pos } => {
-            let start = match (file, pos) {
-                (Some(file), Some(pos)) => BinlogPosition { file, pos },
-                (None, None) => match load_state(&state_path)? {
-                    Some(state) => state.binlog,
-                    None => current_binlog_position(&pool).await?,
-                },
-                _ => anyhow::bail!("--file et --pos doivent etre fournis ensemble"),
-            };
-            let mut sink = MeiliSink::new(&config.meilisearch)?;
-            cdc::run(&config, &pool, &plans, &mut sink, start).await?;
-        }
+    });
+    let sync_mode = match command {
+        Command::Run { .. } => SyncMode::Full,
+        Command::Snapshot { .. } => SyncMode::Snapshot,
+        Command::Cdc { .. } => SyncMode::Cdc,
         Command::Position => {
             let position = current_binlog_position(&pool).await?;
             println!("{}:{}", position.file, position.pos);
+            pool.disconnect().await.context("fermeture du pool MySQL")?;
+            return Ok(());
+        }
+    };
+    let sync_run_id = Uuid::now_v7().to_string();
+    let metrics = cli
+        .metrics
+        .then(|| SyncMetrics::start(sync_run_id.clone(), sync_mode));
+
+    let result = async {
+        match command {
+            Command::Run {
+                force_snapshot,
+                recreate_indexes,
+                clear_documents,
+            } => {
+                let mut sink =
+                    MeiliSink::new(&config.meilisearch, sync_run_id.clone(), metrics.clone())?;
+                let state = load_state(&state_path)?;
+                let start = if state.is_none() || force_snapshot {
+                    let position = current_binlog_position(&pool).await?;
+                    if config.runtime.snapshot_on_start || force_snapshot {
+                        let index_preparation = IndexPreparation {
+                            recreate: recreate_indexes,
+                            clear_documents,
+                        };
+                        run_snapshot(
+                            &pool,
+                            &plans,
+                            &mut sink,
+                            index_preparation,
+                            metrics.as_ref(),
+                        )
+                        .await?;
+                    }
+                    let started_at = Instant::now();
+                    let result = save_state(&state_path, &State::new(position.clone()));
+                    if let Some(metrics) = &metrics {
+                        metrics.record_checkpoint_write(started_at.elapsed());
+                    }
+                    result?;
+                    position
+                } else {
+                    state.context("etat absent")?.binlog
+                };
+                cdc::run(&config, &pool, &plans, &mut sink, start, metrics.as_ref()).await
+            }
+            Command::Snapshot {
+                recreate_indexes,
+                clear_documents,
+            } => {
+                let mut sink =
+                    MeiliSink::new(&config.meilisearch, sync_run_id.clone(), metrics.clone())?;
+                let index_preparation = IndexPreparation {
+                    recreate: recreate_indexes,
+                    clear_documents,
+                };
+                run_snapshot(
+                    &pool,
+                    &plans,
+                    &mut sink,
+                    index_preparation,
+                    metrics.as_ref(),
+                )
+                .await
+            }
+            Command::Cdc { file, pos } => {
+                let start = match (file, pos) {
+                    (Some(file), Some(pos)) => BinlogPosition { file, pos },
+                    (None, None) => match load_state(&state_path)? {
+                        Some(state) => state.binlog,
+                        None => current_binlog_position(&pool).await?,
+                    },
+                    _ => anyhow::bail!("--file et --pos doivent etre fournis ensemble"),
+                };
+                let mut sink =
+                    MeiliSink::new(&config.meilisearch, sync_run_id.clone(), metrics.clone())?;
+                cdc::run(&config, &pool, &plans, &mut sink, start, metrics.as_ref()).await
+            }
+            Command::Position => {
+                unreachable!("position est traite avant l'initialisation des metriques")
+            }
         }
     }
+    .await;
 
-    pool.disconnect().await.context("fermeture du pool MySQL")?;
+    let disconnect_result = pool.disconnect().await.context("fermeture du pool MySQL");
+    if let Some(metrics) = metrics {
+        metrics.finish();
+    }
+    result?;
+    disconnect_result?;
     info!("termine");
     Ok(())
 }

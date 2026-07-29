@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,9 +13,9 @@ use meilisearch_sdk::{
 };
 use serde_json::Value as JsonValue;
 use tracing::{error, info};
-use uuid::Uuid;
 
 use crate::config::{MeilisearchConfig, TableConfig};
+use crate::metrics::SyncMetrics;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct BufferKey {
@@ -70,13 +70,17 @@ pub struct MeiliSink {
     task_timeout: Duration,
     buffers: BTreeMap<BufferKey, IndexBuffer>,
     in_flight: VecDeque<PendingSyncTask>,
+    metrics: Option<SyncMetrics>,
 }
 
 impl MeiliSink {
-    pub fn new(config: &MeilisearchConfig) -> Result<Self> {
+    pub fn new(
+        config: &MeilisearchConfig,
+        sync_run_id: String,
+        metrics: Option<SyncMetrics>,
+    ) -> Result<Self> {
         let client = Client::new(config.host.clone(), config.api_key.as_deref())
             .context("creation du client Meilisearch")?;
-        let sync_run_id = Uuid::now_v7().to_string();
         info!(sync_run_id, "session de synchronisation demarree");
         Ok(Self {
             client,
@@ -88,6 +92,7 @@ impl MeiliSink {
             task_timeout: Duration::from_secs(config.task_timeout_secs),
             buffers: BTreeMap::new(),
             in_flight: VecDeque::new(),
+            metrics,
         })
     }
 
@@ -102,11 +107,10 @@ impl MeiliSink {
         let index_exists = self.index_exists(&table.index).await?;
         if preparation.recreate && index_exists {
             info!(index = %table.index, "suppression de l'index Meilisearch");
-            let task = self
-                .client
-                .delete_index(&table.index)
-                .await
-                .with_context(|| format!("suppression de l'index {}", table.index))?;
+            let started_at = Instant::now();
+            let result = self.client.delete_index(&table.index).await;
+            self.record_http_duration(started_at.elapsed());
+            let task = result.with_context(|| format!("suppression de l'index {}", table.index))?;
             self.wait_for_task(task).await?;
         }
 
@@ -116,19 +120,20 @@ impl MeiliSink {
                 primary_key = %table.primary_key,
                 "creation de l'index Meilisearch"
             );
-            let task = self
+            let started_at = Instant::now();
+            let result = self
                 .client
                 .create_index(&table.index, Some(&table.primary_key))
-                .await
-                .with_context(|| format!("creation de l'index {}", table.index))?;
+                .await;
+            self.record_http_duration(started_at.elapsed());
+            let task = result.with_context(|| format!("creation de l'index {}", table.index))?;
             self.wait_for_task(task).await?;
         } else if preparation.clear_documents {
             info!(index = %table.index, "suppression des documents Meilisearch");
-            let task = self
-                .client
-                .index(&table.index)
-                .delete_all_documents()
-                .await
+            let started_at = Instant::now();
+            let result = self.client.index(&table.index).delete_all_documents().await;
+            self.record_http_duration(started_at.elapsed());
+            let task = result
                 .with_context(|| format!("suppression des documents dans {}", table.index))?;
             self.wait_for_task(task).await?;
         }
@@ -308,16 +313,31 @@ impl MeiliSink {
             .map(|(document, _)| document)
             .collect::<Vec<_>>();
         let index = self.client.index(&key.index_uid);
-        let task = index
+        if let Some(metrics) = &self.metrics {
+            metrics.record_batch(document_values.len(), &document_values);
+        }
+        let started_at = Instant::now();
+        let result = index
             .add_documents(&document_values, Some(&key.primary_key))
-            .await
-            .with_context(|| {
-                format!(
-                    "envoi de {} documents vers {}",
-                    document_values.len(),
-                    key.index_uid
-                )
-            })?;
+            .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_meilisearch_http(started_at.elapsed());
+        }
+        let task = match result {
+            Ok(task) => task,
+            Err(error) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_task_failure(document_values.len());
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "envoi de {} documents vers {}",
+                        document_values.len(),
+                        key.index_uid
+                    )
+                });
+            }
+        };
         self.track_task(task, key, OperationKind::Upsert, document_ids, event_ids)
             .await
     }
@@ -337,22 +357,38 @@ impl MeiliSink {
                 .filter_map(|(_, event_id)| event_id.as_deref()),
         );
         let index = self.client.index(&key.index_uid);
-        let task = index
-            .delete_documents(&document_ids)
-            .await
-            .with_context(|| {
-                format!(
-                    "suppression de {} documents dans {}",
-                    document_ids.len(),
-                    key.index_uid
-                )
-            })?;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_batch(document_ids.len(), &document_ids);
+        }
+        let started_at = Instant::now();
+        let result = index.delete_documents(&document_ids).await;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_meilisearch_http(started_at.elapsed());
+        }
+        let task = match result {
+            Ok(task) => task,
+            Err(error) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_task_failure(document_ids.len());
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "suppression de {} documents dans {}",
+                        document_ids.len(),
+                        key.index_uid
+                    )
+                });
+            }
+        };
         self.track_task(task, key, OperationKind::Delete, document_ids, event_ids)
             .await
     }
 
     async fn index_exists(&self, index_uid: &str) -> Result<bool> {
-        match self.client.get_index(index_uid).await {
+        let started_at = Instant::now();
+        let result = self.client.get_index(index_uid).await;
+        self.record_http_duration(started_at.elapsed());
+        match result {
             Ok(_) => Ok(true),
             Err(error) if is_index_not_found(&error) => Ok(false),
             Err(error) => Err(error).with_context(|| format!("lecture de l'index {index_uid}")),
@@ -361,13 +397,21 @@ impl MeiliSink {
 
     async fn apply_settings(&self, table: &TableConfig) -> Result<()> {
         let settings = settings_for_table(table);
-        let task = self
+        let started_at = Instant::now();
+        let result = self
             .client
             .index(&table.index)
             .set_settings(&settings)
-            .await
-            .with_context(|| format!("configuration de l'index {}", table.index))?;
+            .await;
+        self.record_http_duration(started_at.elapsed());
+        let task = result.with_context(|| format!("configuration de l'index {}", table.index))?;
         self.wait_for_task(task).await
+    }
+
+    fn record_http_duration(&self, elapsed: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_meilisearch_http(elapsed);
+        }
     }
 
     async fn track_task(
@@ -415,7 +459,12 @@ impl MeiliSink {
                 .in_flight
                 .pop_front()
                 .context("file de taches Meilisearch incoherente")?;
-            self.wait_for_sync_task(task).await?;
+            let started_at = Instant::now();
+            let result = self.wait_for_sync_task(task).await;
+            if let Some(metrics) = &self.metrics {
+                metrics.record_batch_wait(started_at.elapsed());
+            }
+            result?;
         }
         Ok(())
     }
@@ -438,6 +487,9 @@ impl MeiliSink {
                 event_ids = ?task.event_ids,
                 "tache Meilisearch echouee"
             );
+            if let Some(metrics) = &self.metrics {
+                metrics.record_task_failure(task.document_ids.len());
+            }
             bail!("tache Meilisearch {task_uid} en echec: {failure}");
         }
         info!(
@@ -452,6 +504,9 @@ impl MeiliSink {
             event_ids = ?task.event_ids,
             "tache Meilisearch terminee avec succes"
         );
+        if let Some(metrics) = &self.metrics {
+            metrics.record_task_success(task.document_ids.len());
+        }
         Ok(())
     }
 
@@ -473,10 +528,15 @@ impl MeiliSink {
 
     async fn wait_for_task_status(&self, task: TaskInfo) -> Result<Task> {
         let task_uid = task.task_uid;
-        self.client
+        let started_at = Instant::now();
+        let result = self
+            .client
             .wait_for_task(task, Some(self.task_poll), Some(self.task_timeout))
-            .await
-            .with_context(|| format!("attente de la tache Meilisearch {task_uid}"))
+            .await;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_meilisearch_task_wait(started_at.elapsed());
+        }
+        result.with_context(|| format!("attente de la tache Meilisearch {task_uid}"))
     }
 }
 
