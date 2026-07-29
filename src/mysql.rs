@@ -317,7 +317,19 @@ async fn snapshot_table(pool: &Pool, plan: &TablePlan, sink: &mut MeiliSink) -> 
         let mut rows_in_batch = 0_usize;
         while let Some(row) = result.next().await? {
             let pk = plan.row_primary_key(&row)?;
-            documents.push(plan.row_to_document(&row)?);
+            let document_id = mysql_value_to_document_id(&pk);
+            let document = plan.row_to_document(&row)?;
+            info!(
+                sync_mode = "snapshot",
+                source_database = %plan.key.database,
+                source_table = %plan.key.table,
+                index = %plan.config.index,
+                primary_key = %plan.config.primary_key,
+                document_id = %document_id,
+                document = %document,
+                "document ajoute au lot de synchronisation"
+            );
+            documents.push(document);
             last_pk = Some(pk);
             rows_in_batch += 1;
             total_rows += 1;

@@ -121,63 +121,129 @@ async fn process_rows_event(
 
     for row in rows_event_rows(&rows_event, table_map_event) {
         let (before, after) = row?;
-        match operation_from_rows(plan, before.as_ref(), after.as_ref())? {
-            RowOperation::Ignored => {}
-            RowOperation::Delete { document_id } => {
-                sink.push(SyncOperation::Delete {
-                    index_uid: plan.config.index.clone(),
-                    primary_key: plan.config.primary_key.clone(),
-                    document_id,
-                })
-                .await?;
-            }
-            RowOperation::Upsert {
-                document,
-                primary_key,
-                needs_fetch,
-                previous_id,
-            } => {
-                if let Some(previous_id) = previous_id {
-                    let current_id = mysql_value_to_document_id(&primary_key);
-                    if previous_id != current_id {
-                        sink.push(SyncOperation::Delete {
-                            index_uid: plan.config.index.clone(),
-                            primary_key: plan.config.primary_key.clone(),
-                            document_id: previous_id,
-                        })
-                        .await?;
-                    }
-                }
-
-                let document = if needs_fetch {
-                    fetch_document_by_pk(pool, plan, &primary_key).await?
-                } else {
-                    document
-                };
-
-                match document {
-                    Some(document) => {
-                        sink.push(SyncOperation::Upsert {
-                            index_uid: plan.config.index.clone(),
-                            primary_key: plan.config.primary_key.clone(),
-                            document,
-                        })
-                        .await?;
-                    }
-                    None => {
-                        sink.push(SyncOperation::Delete {
-                            index_uid: plan.config.index.clone(),
-                            primary_key: plan.config.primary_key.clone(),
-                            document_id: mysql_value_to_document_id(&primary_key),
-                        })
-                        .await?;
-                    }
-                }
-            }
-        }
+        let operation = operation_from_rows(plan, before.as_ref(), after.as_ref())?;
+        queue_row_operation(pool, plan, sink, operation).await?;
     }
 
     Ok(())
+}
+
+async fn queue_row_operation(
+    pool: &Pool,
+    plan: &TablePlan,
+    sink: &mut MeiliSink,
+    operation: RowOperation,
+) -> Result<()> {
+    match operation {
+        RowOperation::Ignored => Ok(()),
+        RowOperation::Delete { document_id } => {
+            queue_delete(
+                sink,
+                plan,
+                document_id,
+                "suppression dans MySQL",
+                false,
+                None,
+            )
+            .await
+        }
+        RowOperation::Upsert {
+            document,
+            primary_key,
+            needs_fetch,
+            previous_id,
+        } => {
+            let document_id = mysql_value_to_document_id(&primary_key);
+            if let Some(previous_id) = previous_id
+                && previous_id != document_id
+            {
+                queue_delete(
+                    sink,
+                    plan,
+                    previous_id,
+                    "changement de cle primaire",
+                    false,
+                    Some(&document_id),
+                )
+                .await?;
+            }
+
+            let document = if needs_fetch {
+                fetch_document_by_pk(pool, plan, &primary_key).await?
+            } else {
+                document
+            };
+            if let Some(document) = document {
+                queue_upsert(sink, plan, document_id, document, needs_fetch).await
+            } else {
+                queue_delete(
+                    sink,
+                    plan,
+                    document_id,
+                    "document absent ou exclu par la clause where",
+                    needs_fetch,
+                    None,
+                )
+                .await
+            }
+        }
+    }
+}
+
+async fn queue_upsert(
+    sink: &mut MeiliSink,
+    plan: &TablePlan,
+    document_id: String,
+    document: serde_json::Value,
+    reread_from_mysql: bool,
+) -> Result<()> {
+    info!(
+        sync_mode = "cdc",
+        operation = "upsert",
+        source_database = %plan.key.database,
+        source_table = %plan.key.table,
+        index = %plan.config.index,
+        primary_key = %plan.config.primary_key,
+        document_id = %document_id,
+        reread_from_mysql,
+        document = %document,
+        "document ajoute au lot de synchronisation"
+    );
+    sink.push(SyncOperation::Upsert {
+        index_uid: plan.config.index.clone(),
+        primary_key: plan.config.primary_key.clone(),
+        document,
+    })
+    .await
+}
+
+async fn queue_delete(
+    sink: &mut MeiliSink,
+    plan: &TablePlan,
+    document_id: String,
+    reason: &str,
+    reread_from_mysql: bool,
+    replacement_document_id: Option<&str>,
+) -> Result<()> {
+    info!(
+        sync_mode = "cdc",
+        operation = "delete",
+        reason,
+        source_database = %plan.key.database,
+        source_table = %plan.key.table,
+        index = %plan.config.index,
+        primary_key = %plan.config.primary_key,
+        document_id = %document_id,
+        reread_from_mysql,
+        replacement_document_id = ?replacement_document_id,
+        "document marque pour suppression dans Meilisearch"
+    );
+    sink.push(SyncOperation::Delete {
+        index_uid: plan.config.index.clone(),
+        primary_key: plan.config.primary_key.clone(),
+        document_id,
+    })
+    .await
 }
 
 async fn checkpoint(

@@ -59,7 +59,7 @@ pub struct MeiliSink {
     task_poll: Duration,
     task_timeout: Duration,
     buffers: BTreeMap<BufferKey, IndexBuffer>,
-    in_flight: VecDeque<TaskInfo>,
+    in_flight: VecDeque<PendingSyncTask>,
 }
 
 impl MeiliSink {
@@ -196,7 +196,7 @@ impl MeiliSink {
 
     pub async fn wait_all(&mut self) -> Result<()> {
         while let Some(task) = self.in_flight.pop_front() {
-            self.wait_for_task(task).await?;
+            self.wait_for_sync_task(task).await?;
         }
         Ok(())
     }
@@ -250,6 +250,7 @@ impl MeiliSink {
     }
 
     async fn submit_upserts(&mut self, key: &BufferKey, documents: &[JsonValue]) -> Result<()> {
+        let document_ids = document_ids(documents, &key.primary_key);
         let index = self.client.index(&key.index_uid);
         let task = index
             .add_documents(documents, Some(&key.primary_key))
@@ -261,7 +262,8 @@ impl MeiliSink {
                     key.index_uid
                 )
             })?;
-        self.track_task(task).await
+        self.track_task(task, key, OperationKind::Upsert, document_ids)
+            .await
     }
 
     async fn submit_deletes(&mut self, key: &BufferKey, document_ids: &[String]) -> Result<()> {
@@ -276,7 +278,8 @@ impl MeiliSink {
                     key.index_uid
                 )
             })?;
-        self.track_task(task).await
+        self.track_task(task, key, OperationKind::Delete, document_ids.to_vec())
+            .await
     }
 
     async fn index_exists(&self, index_uid: &str) -> Result<bool> {
@@ -298,15 +301,51 @@ impl MeiliSink {
         self.wait_for_task(task).await
     }
 
-    async fn track_task(&mut self, task: TaskInfo) -> Result<()> {
-        self.in_flight.push_back(task);
+    async fn track_task(
+        &mut self,
+        task: TaskInfo,
+        key: &BufferKey,
+        operation: OperationKind,
+        document_ids: Vec<String>,
+    ) -> Result<()> {
+        info!(
+            task_uid = task.task_uid,
+            operation = operation.as_str(),
+            index = %key.index_uid,
+            primary_key = %key.primary_key,
+            documents = document_ids.len(),
+            document_ids = ?document_ids,
+            "lot de synchronisation soumis a Meilisearch"
+        );
+        self.in_flight.push_back(PendingSyncTask {
+            task,
+            index_uid: key.index_uid.clone(),
+            primary_key: key.primary_key.clone(),
+            operation,
+            document_ids,
+        });
         while self.in_flight.len() >= self.max_in_flight_tasks {
             let task = self
                 .in_flight
                 .pop_front()
                 .context("file de taches Meilisearch incoherente")?;
-            self.wait_for_task(task).await?;
+            self.wait_for_sync_task(task).await?;
         }
+        Ok(())
+    }
+
+    async fn wait_for_sync_task(&self, task: PendingSyncTask) -> Result<()> {
+        let task_uid = task.task.task_uid;
+        self.wait_for_task(task.task).await?;
+        info!(
+            task_uid,
+            operation = task.operation.as_str(),
+            index = %task.index_uid,
+            primary_key = %task.primary_key,
+            documents = task.document_ids.len(),
+            document_ids = ?task.document_ids,
+            "lot de synchronisation Meilisearch termine"
+        );
         Ok(())
     }
 
@@ -329,6 +368,36 @@ impl MeiliSink {
 enum OperationKind {
     Upsert,
     Delete,
+}
+
+impl OperationKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Upsert => "upsert",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingSyncTask {
+    task: TaskInfo,
+    index_uid: String,
+    primary_key: String,
+    operation: OperationKind,
+    document_ids: Vec<String>,
+}
+
+fn document_ids(documents: &[JsonValue], primary_key: &str) -> Vec<String> {
+    documents
+        .iter()
+        .map(|document| {
+            document.get(primary_key).map_or_else(
+                || format!("<cle '{primary_key}' absente>"),
+                JsonValue::to_string,
+            )
+        })
+        .collect()
 }
 
 fn settings_for_table(table: &TableConfig) -> Settings {
