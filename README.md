@@ -52,6 +52,39 @@ cargo run --release -- snapshot --clear-documents
 cargo run --release -- cdc --file mysql-bin.000001 --pos 4
 ```
 
+### Metriques de performance
+
+Ajouter `--metrics` pour produire, a la fin de la synchronisation, deux logs
+`INFO` structures : un bilan des volumes et ressources, puis la repartition du
+temps par etape. L'option est disponible pour `run`, `snapshot` et `cdc` et
+reste desactivee par defaut.
+
+```bash
+cargo run --release -- snapshot --metrics
+cargo run --release -- run --metrics
+cargo run --release -- cdc --metrics --file mysql-bin.000001 --pos 4
+```
+
+`snapshot` s'arrete apres le chargement et ecrit immediatement son bilan.
+`run` et `cdc` ecrivent aussi un bilan cumule a chaque intervalle de flush qui
+a recu des evenements CDC, puis un bilan final lors d'un arret propre (par
+exemple `Ctrl+C`) ou si la synchronisation se termine sur une erreur.
+
+Exemple de sortie (les champs sont des paires `cle=valeur` exploitables par un
+collecteur de logs) :
+
+```text
+INFO synchronisation terminee sync_run_id="..." sync_mode="full" duration_ms=48231 documents_read=125000 documents_indexed=124998 documents_failed=2 documents_per_second=2591.7 bytes_read=184293891 bytes_sent=91293821 average_batch_size=487.0 peak_memory_mb=184 average_cpu_percent=72.4 rss_bytes=192937984 virtual_memory_bytes=823132160 peak_rss_bytes=192937984
+INFO repartition du temps de synchronisation sync_run_id="..." sync_duration_ms=48231 mysql_read_ms=12843 transformation_ms=4382 serialization_ms=2144 batch_wait_ms=318 meilisearch_http_ms=11622 meilisearch_task_wait_ms=16417 checkpoint_write_ms=42
+```
+
+`bytes_read` est la taille du JSON normalise des documents lus depuis MySQL,
+et `bytes_sent` celle des lots JSON envoyes a Meilisearch. `rss_bytes`,
+`virtual_memory_bytes` et `peak_rss_bytes` concernent le processus de
+synchronisation; les ressources sont echantillonnees toutes les 500 ms. Les
+compteurs de documents indexes et en echec sont mis a jour lorsque les taches
+Meilisearch sont validees ou echouent.
+
 ## Docker
 
 Construire l'image :
@@ -98,6 +131,16 @@ docker run --rm `
   --mount type=bind,source="${PWD}\config.toml",target=/config/config.toml,readonly `
   --mount type=volume,source=meili-sync-data,target=/data `
   meili-mysql-sync:local snapshot --recreate-indexes
+```
+
+Pour obtenir le bilan de performance dans les logs du conteneur :
+
+```powershell
+docker run --rm `
+  --env RUST_LOG=info `
+  --mount type=bind,source="${PWD}\config.toml",target=/config/config.toml,readonly `
+  --mount type=volume,source=meili-sync-data,target=/data `
+  meili-mysql-sync:local snapshot --metrics
 ```
 
 Commandes d'exploitation :

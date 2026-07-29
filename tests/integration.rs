@@ -110,7 +110,7 @@ async fn config_state_and_sink_buffer_work_together() -> anyhow::Result<()> {
     let loaded = load_state(&config.runtime.state_path)?.expect("state should have been saved");
     assert_eq!(loaded.binlog, position);
 
-    let mut sink = MeiliSink::new(&config.meilisearch)?;
+    let mut sink = MeiliSink::new(&config.meilisearch, "test-run".to_owned(), None)?;
     assert_eq!(sink.batch_size(), 3);
 
     sink.push(SyncOperation::Upsert {
