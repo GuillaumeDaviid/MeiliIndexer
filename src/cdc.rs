@@ -74,6 +74,7 @@ pub async fn run(
                 };
                 let event = event.context("lecture d'un evenement binlog")?;
                 update_position_from_header(&mut latest_position, &event);
+                let event_id = format!("{}:{}", latest_position.file, latest_position.pos);
 
                 let data = event.read_data().context("decodage d'un evenement binlog")?;
                 if let Some(data) = data {
@@ -82,7 +83,7 @@ pub async fn run(
                         latest_position.pos = rotate.position();
                     }
                     if let EventData::RowsEvent(rows_event) = data {
-                        process_rows_event(pool, plans, sink, &stream, rows_event).await?;
+                        process_rows_event(pool, plans, sink, &stream, rows_event, &event_id).await?;
                     }
                 }
 
@@ -104,6 +105,7 @@ async fn process_rows_event(
     sink: &mut MeiliSink,
     stream: &mysql_async::BinlogStream,
     rows_event: RowsEventData<'_>,
+    event_id: &str,
 ) -> Result<()> {
     let table_id = rows_event.table_id();
     let Some(table_map_event) = stream.get_tme(table_id) else {
@@ -122,7 +124,7 @@ async fn process_rows_event(
     for row in rows_event_rows(&rows_event, table_map_event) {
         let (before, after) = row?;
         let operation = operation_from_rows(plan, before.as_ref(), after.as_ref())?;
-        queue_row_operation(pool, plan, sink, operation).await?;
+        queue_row_operation(pool, plan, sink, operation, event_id).await?;
     }
 
     Ok(())
@@ -133,6 +135,7 @@ async fn queue_row_operation(
     plan: &TablePlan,
     sink: &mut MeiliSink,
     operation: RowOperation,
+    event_id: &str,
 ) -> Result<()> {
     match operation {
         RowOperation::Ignored => Ok(()),
@@ -144,6 +147,7 @@ async fn queue_row_operation(
                 "suppression dans MySQL",
                 false,
                 None,
+                event_id,
             )
             .await
         }
@@ -164,6 +168,7 @@ async fn queue_row_operation(
                     "changement de cle primaire",
                     false,
                     Some(&document_id),
+                    event_id,
                 )
                 .await?;
             }
@@ -174,7 +179,7 @@ async fn queue_row_operation(
                 document
             };
             if let Some(document) = document {
-                queue_upsert(sink, plan, document_id, document, needs_fetch).await
+                queue_upsert(sink, plan, document_id, document, needs_fetch, event_id).await
             } else {
                 queue_delete(
                     sink,
@@ -183,6 +188,7 @@ async fn queue_row_operation(
                     "document absent ou exclu par la clause where",
                     needs_fetch,
                     None,
+                    event_id,
                 )
                 .await
             }
@@ -196,9 +202,12 @@ async fn queue_upsert(
     document_id: String,
     document: serde_json::Value,
     reread_from_mysql: bool,
+    event_id: &str,
 ) -> Result<()> {
     info!(
         sync_mode = "cdc",
+        sync_run_id = %sink.sync_run_id(),
+        event_id,
         operation = "upsert",
         source_database = %plan.key.database,
         source_table = %plan.key.table,
@@ -209,11 +218,14 @@ async fn queue_upsert(
         document = %document,
         "document ajoute au lot de synchronisation"
     );
-    sink.push(SyncOperation::Upsert {
-        index_uid: plan.config.index.clone(),
-        primary_key: plan.config.primary_key.clone(),
-        document,
-    })
+    sink.push_for_event(
+        SyncOperation::Upsert {
+            index_uid: plan.config.index.clone(),
+            primary_key: plan.config.primary_key.clone(),
+            document,
+        },
+        event_id.to_owned(),
+    )
     .await
 }
 
@@ -224,9 +236,12 @@ async fn queue_delete(
     reason: &str,
     reread_from_mysql: bool,
     replacement_document_id: Option<&str>,
+    event_id: &str,
 ) -> Result<()> {
     info!(
         sync_mode = "cdc",
+        sync_run_id = %sink.sync_run_id(),
+        event_id,
         operation = "delete",
         reason,
         source_database = %plan.key.database,
@@ -238,11 +253,14 @@ async fn queue_delete(
         replacement_document_id = ?replacement_document_id,
         "document marque pour suppression dans Meilisearch"
     );
-    sink.push(SyncOperation::Delete {
-        index_uid: plan.config.index.clone(),
-        primary_key: plan.config.primary_key.clone(),
-        document_id,
-    })
+    sink.push_for_event(
+        SyncOperation::Delete {
+            index_uid: plan.config.index.clone(),
+            primary_key: plan.config.primary_key.clone(),
+            document_id,
+        },
+        event_id.to_owned(),
+    )
     .await
 }
 

@@ -2,3 +2,4 @@
 /config.toml
 /meili-sync-state.json
 /.docker-run/
+/.cargo-target-codex/
