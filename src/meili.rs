@@ -432,7 +432,6 @@ impl MeiliSink {
             index = %key.index_uid,
             primary_key = %key.primary_key,
             documents = document_ids.len(),
-            document_ids = ?document_ids,
             event_ids = ?event_ids,
             "lot de synchronisation soumis a Meilisearch"
         );
@@ -483,7 +482,7 @@ impl MeiliSink {
                 operation = task.operation.as_str(),
                 index = %task.index_uid,
                 primary_key = %task.primary_key,
-                document_ids = ?task.document_ids,
+                documents = task.document_ids.len(),
                 event_ids = ?task.event_ids,
                 "tache Meilisearch echouee"
             );
@@ -500,7 +499,6 @@ impl MeiliSink {
             index = %task.index_uid,
             primary_key = %task.primary_key,
             documents = task.document_ids.len(),
-            document_ids = ?task.document_ids,
             event_ids = ?task.event_ids,
             "tache Meilisearch terminee avec succes"
         );

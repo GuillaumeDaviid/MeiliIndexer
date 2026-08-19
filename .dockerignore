@@ -5,6 +5,7 @@ target/
 .rust-skills/
 
 config.toml
+*.secret
 meili-sync-state.json
 
 Dockerfile

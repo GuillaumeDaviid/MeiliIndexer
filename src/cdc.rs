@@ -201,12 +201,10 @@ async fn queue_row_operation(
                 document
             };
             if let Some(document) = document {
-                if !needs_fetch {
-                    if let Some(metrics) = metrics {
-                        metrics.record_document_read(&document);
-                    }
+                if !needs_fetch && let Some(metrics) = metrics {
+                    metrics.record_document_read(&document);
                 }
-                queue_upsert(sink, plan, document_id, document, needs_fetch, event_id).await
+                queue_upsert(sink, plan, document, needs_fetch, event_id).await
             } else {
                 queue_delete(
                     sink,
@@ -226,7 +224,6 @@ async fn queue_row_operation(
 async fn queue_upsert(
     sink: &mut MeiliSink,
     plan: &TablePlan,
-    document_id: String,
     document: serde_json::Value,
     reread_from_mysql: bool,
     event_id: &str,
@@ -240,9 +237,7 @@ async fn queue_upsert(
         source_table = %plan.key.table,
         index = %plan.config.index,
         primary_key = %plan.config.primary_key,
-        document_id = %document_id,
         reread_from_mysql,
-        document = %document,
         "document ajoute au lot de synchronisation"
     );
     sink.push_for_event(
@@ -275,9 +270,8 @@ async fn queue_delete(
         source_table = %plan.key.table,
         index = %plan.config.index,
         primary_key = %plan.config.primary_key,
-        document_id = %document_id,
         reread_from_mysql,
-        replacement_document_id = ?replacement_document_id,
+        replaces_document = replacement_document_id.is_some(),
         "document marque pour suppression dans Meilisearch"
     );
     sink.push_for_event(

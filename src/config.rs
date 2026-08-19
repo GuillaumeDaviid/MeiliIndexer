@@ -1,13 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+use mysql_async::Opts;
 use serde::Deserialize;
+use url::Url;
 
-#[derive(Debug, Clone, Deserialize)]
+const MYSQL_URL_ENV: &str = "MEILI_SYNC_MYSQL_URL";
+const MYSQL_URL_FILE_ENV: &str = "MEILI_SYNC_MYSQL_URL_FILE";
+const MEILISEARCH_API_KEY_ENV: &str = "MEILI_SYNC_MEILISEARCH_API_KEY";
+const MEILISEARCH_API_KEY_FILE_ENV: &str = "MEILI_SYNC_MEILISEARCH_API_KEY_FILE";
+
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub mysql: MysqlConfig,
     pub meilisearch: MeilisearchConfig,
@@ -16,17 +24,20 @@ pub struct Config {
     pub tables: Vec<TableConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct MysqlConfig {
     pub url: String,
     pub server_id: u32,
+    #[serde(default)]
+    pub allow_insecure: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct MeilisearchConfig {
     pub host: String,
     pub api_key: Option<String>,
+    pub allow_insecure: bool,
     pub batch_size: usize,
     pub max_in_flight_tasks: usize,
     pub task_poll_ms: u64,
@@ -38,6 +49,7 @@ impl Default for MeilisearchConfig {
         Self {
             host: String::new(),
             api_key: None,
+            allow_insecure: false,
             batch_size: 1_000,
             max_in_flight_tasks: 8,
             task_poll_ms: 100,
@@ -112,8 +124,9 @@ impl Config {
     pub fn from_path(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("lecture de la configuration {}", path.display()))?;
-        let config: Self = toml::from_str(&content)
+        let mut config: Self = toml::from_str(&content)
             .with_context(|| format!("parsing TOML de {}", path.display()))?;
+        config.apply_env_overrides()?;
         config.validate()?;
         Ok(config)
     }
@@ -125,8 +138,35 @@ impl Config {
         if self.mysql.server_id == 0 {
             bail!("mysql.server_id doit etre unique et superieur a 0");
         }
+        let mysql_opts = Opts::from_url(&self.mysql.url).context("parsing de mysql.url")?;
+        if mysql_opts.ssl_opts().is_none()
+            && !is_loopback_host(mysql_opts.ip_or_hostname())
+            && !self.mysql.allow_insecure
+        {
+            bail!(concat!(
+                "mysql.url doit activer TLS avec require_ssl=true hors machine locale; ",
+                "mysql.allow_insecure=true autorise explicitement une exception"
+            ));
+        }
         if self.meilisearch.host.trim().is_empty() {
             bail!("meilisearch.host est obligatoire");
+        }
+        let meilisearch_url =
+            Url::parse(&self.meilisearch.host).context("parsing de meilisearch.host")?;
+        if !matches!(meilisearch_url.scheme(), "http" | "https") {
+            bail!("meilisearch.host doit utiliser le schema http ou https");
+        }
+        let meilisearch_host = meilisearch_url
+            .host_str()
+            .context("meilisearch.host doit contenir un nom d'hote")?;
+        if meilisearch_url.scheme() != "https"
+            && !is_loopback_host(meilisearch_host)
+            && !self.meilisearch.allow_insecure
+        {
+            bail!(concat!(
+                "meilisearch.host doit utiliser HTTPS hors machine locale; ",
+                "meilisearch.allow_insecure=true autorise explicitement une exception"
+            ));
         }
         if self.meilisearch.batch_size == 0 {
             bail!("meilisearch.batch_size doit etre superieur a 0");
@@ -156,6 +196,52 @@ impl Config {
         }
         Ok(())
     }
+
+    fn apply_env_overrides(&mut self) -> Result<()> {
+        if let Some(url) = read_secret(MYSQL_URL_ENV, MYSQL_URL_FILE_ENV)? {
+            self.mysql.url = url;
+        }
+        if let Some(api_key) = read_secret(MEILISEARCH_API_KEY_ENV, MEILISEARCH_API_KEY_FILE_ENV)? {
+            self.meilisearch.api_key = Some(api_key);
+        }
+        Ok(())
+    }
+}
+
+fn read_secret(value_env: &str, file_env: &str) -> Result<Option<String>> {
+    let value = read_env(value_env)?;
+    let file = read_env(file_env)?;
+    let secret = match (value, file) {
+        (Some(_), Some(_)) => {
+            bail!("les variables {value_env} et {file_env} ne peuvent pas etre definies ensemble")
+        }
+        (Some(value), None) => value,
+        (None, Some(path)) => fs::read_to_string(&path)
+            .with_context(|| format!("lecture du secret indique par {file_env}: {path}"))?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned(),
+        (None, None) => return Ok(None),
+    };
+    if secret.is_empty() {
+        bail!("le secret fourni par {value_env} ou {file_env} est vide");
+    }
+    Ok(Some(secret))
+}
+
+fn read_env(name: &str) -> Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => bail!("la variable {name} n'est pas en UTF-8"),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 impl TableConfig {
@@ -301,6 +387,7 @@ mod tests {
             mysql: MysqlConfig {
                 url: "mysql://user:password@localhost/shop".to_owned(),
                 server_id: 42,
+                allow_insecure: false,
             },
             meilisearch: MeilisearchConfig {
                 host: "http://localhost:7700".to_owned(),
@@ -408,5 +495,50 @@ mod tests {
             .expect_err("duplicate table/index mapping should be rejected");
 
         assert!(error.to_string().contains("table dupliquee"));
+    }
+
+    #[test]
+    fn validate_rejects_unencrypted_remote_mysql() {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.mysql.url = "mysql://user:password@database.example/shop".to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("remote MySQL without TLS should be rejected");
+
+        assert!(error.to_string().contains("require_ssl=true"));
+    }
+
+    #[test]
+    fn validate_rejects_unencrypted_remote_meilisearch() {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.meilisearch.host = "http://search.example:7700".to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("remote Meilisearch without TLS should be rejected");
+
+        assert!(error.to_string().contains("doit utiliser HTTPS"));
+    }
+
+    #[test]
+    fn validate_accepts_encrypted_remote_services() -> Result<()> {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.mysql.url =
+            "mysql://user:password@database.example/shop?require_ssl=true".to_owned();
+        config.meilisearch.host = "https://search.example:7700".to_owned();
+
+        config.validate()
+    }
+
+    #[test]
+    fn validate_requires_explicit_override_for_insecure_private_networks() -> Result<()> {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.mysql.url = "mysql://user:password@mysql/shop".to_owned();
+        config.mysql.allow_insecure = true;
+        config.meilisearch.host = "http://meilisearch:7700".to_owned();
+        config.meilisearch.allow_insecure = true;
+
+        config.validate()
     }
 }

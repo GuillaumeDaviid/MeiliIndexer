@@ -335,7 +335,6 @@ async fn snapshot_table(
                 break;
             };
             let pk = plan.row_primary_key(&row)?;
-            let document_id = mysql_value_to_document_id(&pk);
             let started_at = Instant::now();
             let document = plan.row_to_document(&row)?;
             if let Some(metrics) = metrics {
@@ -348,8 +347,6 @@ async fn snapshot_table(
                 source_table = %plan.key.table,
                 index = %plan.config.index,
                 primary_key = %plan.config.primary_key,
-                document_id = %document_id,
-                document = %document,
                 "document ajoute au lot de synchronisation"
             );
             documents.push(document);

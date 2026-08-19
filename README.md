@@ -28,10 +28,12 @@ binlog_row_image = FULL
 `binlog_row_image=MINIMAL` fonctionne pour filtrer les updates, mais l'outil relira la ligne dans MySQL quand un update ne contient pas tous les champs du document.
 Si `where_clause` depend de colonnes non presentes dans `fields`, ajoute ces colonnes a `watch_fields` pour que leurs updates declenchent une relecture et, si necessaire, une suppression dans Meilisearch.
 
-L'utilisateur MySQL a besoin des droits de lecture sur les tables, `information_schema`, et du flux replication :
+L'utilisateur MySQL a besoin des droits de lecture sur les seules bases synchronisees et du flux
+de replication. Ne lui accorde pas `SELECT` sur toutes les bases :
 
 ```sql
-GRANT SELECT, REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'sync_user'@'%';
+GRANT SELECT ON football_data.* TO 'sync_user'@'%';
+GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'sync_user'@'%';
 ```
 
 ## Utilisation
@@ -41,6 +43,21 @@ Copier `config.example.toml` vers `config.toml`, adapter les tables, puis lancer
 ```bash
 cargo run --release -- run
 ```
+
+Les secrets peuvent remplacer les valeurs TOML sans etre stockes dans `config.toml` :
+
+```bash
+export MEILI_SYNC_MYSQL_URL_FILE=/run/secrets/mysql-url
+export MEILI_SYNC_MEILISEARCH_API_KEY_FILE=/run/secrets/meilisearch-api-key
+```
+
+Chaque fichier contient uniquement le secret correspondant. Les variantes directes
+`MEILI_SYNC_MYSQL_URL` et `MEILI_SYNC_MEILISEARCH_API_KEY` existent pour le developpement,
+mais les variantes `_FILE` sont preferees en production.
+
+Hors `localhost`, `127.0.0.0/8` et `::1`, MySQL doit utiliser `require_ssl=true` et
+Meilisearch doit utiliser `https://`. `allow_insecure = true` existe dans chaque section
+uniquement pour une derogation reseau explicite.
 
 Commandes utiles :
 
@@ -69,6 +86,7 @@ cargo run --release -- cdc --metrics --file mysql-bin.000001 --pos 4
 `run` et `cdc` ecrivent aussi un bilan cumule a chaque intervalle de flush qui
 a recu des evenements CDC, puis un bilan final lors d'un arret propre (par
 exemple `Ctrl+C`) ou si la synchronisation se termine sur une erreur.
+Les valeurs des documents et leurs identifiants ne sont jamais ecrits dans les logs.
 
 Exemple de sortie (les champs sont des paires `cle=valeur` exploitables par un
 collecteur de logs) :
@@ -156,18 +174,21 @@ Variables d'environnement utiles :
 | Variable | Obligatoire | Defaut | Description |
 | --- | --- | --- | --- |
 | `RUST_LOG` | Non | `info` | Niveau de logs Rust/tracing. Exemples : `debug`, `info`, `warn`, `meili_mysql_sync=debug`. |
+| `MEILI_SYNC_MYSQL_URL_FILE` | Production | - | Fichier contenant l'URL MySQL complete, mot de passe inclus. |
+| `MEILI_SYNC_MEILISEARCH_API_KEY_FILE` | Production | - | Fichier contenant une cle Meilisearch restreinte. |
+| `MEILI_SYNC_MYSQL_URL` | Non | - | Remplacement direct de `mysql.url`, moins adapte aux secrets de production. |
+| `MEILI_SYNC_MEILISEARCH_API_KEY` | Non | - | Remplacement direct de `meilisearch.api_key`. |
 
-Les autres parametres ne sont pas lus depuis l'environnement par l'application :
-ils doivent rester dans `config.toml`.
+Ne definis pas simultanement une variable directe et sa variante `_FILE`.
 
 Parametres importants a verifier dans `config.toml` pour Docker :
 
 | Chemin TOML | Exemple Docker | Description |
 | --- | --- | --- |
-| `mysql.url` | `mysql://sync_user:sync_password@mysql:3306/football_data` | Utiliser le nom du service Docker MySQL, ou `host.docker.internal` si MySQL tourne sur la machine hote. |
+| `mysql.url` | `mysql://sync_user@mysql:3306/football_data?require_ssl=true` | Utiliser TLS hors loopback et fournir l'URL avec secret via la variante `_FILE`. |
 | `mysql.server_id` | `7101` | Identifiant de replication unique pour ce client CDC. |
-| `meilisearch.host` | `http://meilisearch:7700` | Utiliser le nom du service Docker Meilisearch, ou `host.docker.internal` si Meilisearch tourne sur la machine hote. |
-| `meilisearch.api_key` | `masterKey` | Cle API Meilisearch. Ne pas la mettre dans l'image Docker. |
+| `meilisearch.host` | `https://meilisearch:7700` | Utiliser HTTPS hors loopback. |
+| `meilisearch.api_key` | omis | Fournir une cle limitee aux index et actions necessaires via la variante `_FILE`. |
 | `runtime.state_path` | `meili-sync-state.json` ou `/data/meili-sync-state.json` | Fichier de checkpoint binlog. Il doit etre conserve sur un volume persistant. |
 
 Dans un conteneur, `127.0.0.1` designe le conteneur lui-meme. Ne l'utilise
@@ -207,12 +228,12 @@ Procedure exacte :
 
    ```toml
    [mysql]
-   url = "mysql://sync_user:sync_password@mysql:3306/football_data"
+   # Remplace par MEILI_SYNC_MYSQL_URL_FILE au demarrage.
+   url = ""
    server_id = 7101
 
    [meilisearch]
-   host = "http://meilisearch:7700"
-   api_key = "masterKey"
+   host = "https://meilisearch:7700"
    batch_size = 50000
    max_in_flight_tasks = 4
    task_poll_ms = 100
@@ -236,13 +257,13 @@ Procedure exacte :
 
    Points a verifier :
 
-   - `mysql.url` doit etre joignable depuis le conteneur ;
-   - `meilisearch.host` doit etre joignable depuis le conteneur ;
+   - l'URL MySQL fournie par secret doit contenir `require_ssl=true` ;
+   - `meilisearch.host` doit etre joignable en HTTPS depuis le conteneur ;
    - `mysql.server_id` doit etre unique pour chaque instance de sync ;
    - `runtime.state_path` doit pointer vers `/data/...` pour garder le
      checkpoint dans le volume ;
-   - la cle Meilisearch reste dans `config.toml` ou dans un fichier secret
-     monte comme config, jamais dans l'image.
+   - la cle Meilisearch doit etre restreinte aux index et actions necessaires et montee
+     dans un fichier secret, jamais placee dans l'image ou `config.toml`.
 
 3. Creer le volume d'etat.
 
@@ -260,7 +281,11 @@ Procedure exacte :
      --restart unless-stopped \
      --network app-network \
      --env RUST_LOG=info \
+     --env MEILI_SYNC_MYSQL_URL_FILE=/run/secrets/mysql-url \
+     --env MEILI_SYNC_MEILISEARCH_API_KEY_FILE=/run/secrets/meilisearch-api-key \
      --mount type=bind,source="$(pwd)/config.toml",target=/config/config.toml,readonly \
+     --mount type=bind,source="$(pwd)/mysql-url.secret",target=/run/secrets/mysql-url,readonly \
+     --mount type=bind,source="$(pwd)/meilisearch-api-key.secret",target=/run/secrets/meilisearch-api-key,readonly \
      --mount type=volume,source=meili-sync-data,target=/data \
      registry.example.com/meili-mysql-sync:0.1.0
    ```
@@ -273,7 +298,11 @@ Procedure exacte :
      --restart unless-stopped \
      --add-host=host.docker.internal:host-gateway \
      --env RUST_LOG=info \
+     --env MEILI_SYNC_MYSQL_URL_FILE=/run/secrets/mysql-url \
+     --env MEILI_SYNC_MEILISEARCH_API_KEY_FILE=/run/secrets/meilisearch-api-key \
      --mount type=bind,source="$(pwd)/config.toml",target=/config/config.toml,readonly \
+     --mount type=bind,source="$(pwd)/mysql-url.secret",target=/run/secrets/mysql-url,readonly \
+     --mount type=bind,source="$(pwd)/meilisearch-api-key.secret",target=/run/secrets/meilisearch-api-key,readonly \
      --mount type=volume,source=meili-sync-data,target=/data \
      registry.example.com/meili-mysql-sync:0.1.0
    ```
@@ -309,7 +338,11 @@ Procedure exacte :
      --restart unless-stopped \
      --network app-network \
      --env RUST_LOG=info \
+     --env MEILI_SYNC_MYSQL_URL_FILE=/run/secrets/mysql-url \
+     --env MEILI_SYNC_MEILISEARCH_API_KEY_FILE=/run/secrets/meilisearch-api-key \
      --mount type=bind,source="$(pwd)/config.toml",target=/config/config.toml,readonly \
+     --mount type=bind,source="$(pwd)/mysql-url.secret",target=/run/secrets/mysql-url,readonly \
+     --mount type=bind,source="$(pwd)/meilisearch-api-key.secret",target=/run/secrets/meilisearch-api-key,readonly \
      --mount type=volume,source=meili-sync-data,target=/data \
      registry.example.com/meili-mysql-sync:0.1.1
    ```
@@ -324,8 +357,12 @@ services:
     restart: unless-stopped
     environment:
       RUST_LOG: info
+      MEILI_SYNC_MYSQL_URL_FILE: /run/secrets/mysql-url
+      MEILI_SYNC_MEILISEARCH_API_KEY_FILE: /run/secrets/meilisearch-api-key
     volumes:
       - ./config.toml:/config/config.toml:ro
+      - ./mysql-url.secret:/run/secrets/mysql-url:ro
+      - ./meilisearch-api-key.secret:/run/secrets/meilisearch-api-key:ro
       - meili-sync-data:/data
     networks:
       - app-network

@@ -20,3 +20,7 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Install RustSec audit
+      run: cargo install cargo-audit --locked
+    - name: Audit dependencies
+      run: cargo audit --deny warnings
