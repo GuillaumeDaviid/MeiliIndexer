@@ -123,9 +123,9 @@ impl Default for TableConfig {
 impl Config {
     pub fn from_path(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
-            .with_context(|| format!("lecture de la configuration {}", path.display()))?;
+            .with_context(|| format!("reading configuration {}", path.display()))?;
         let mut config: Self = toml::from_str(&content)
-            .with_context(|| format!("parsing TOML de {}", path.display()))?;
+            .with_context(|| format!("parsing TOML in {}", path.display()))?;
         config.apply_env_overrides()?;
         config.validate()?;
         Ok(config)
@@ -133,49 +133,49 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         if self.mysql.url.trim().is_empty() {
-            bail!("mysql.url est obligatoire");
+            bail!("mysql.url is required");
         }
         if self.mysql.server_id == 0 {
-            bail!("mysql.server_id doit etre unique et superieur a 0");
+            bail!("mysql.server_id must be unique and greater than 0");
         }
-        let mysql_opts = Opts::from_url(&self.mysql.url).context("parsing de mysql.url")?;
+        let mysql_opts = Opts::from_url(&self.mysql.url).context("parsing mysql.url")?;
         if mysql_opts.ssl_opts().is_none()
             && !is_loopback_host(mysql_opts.ip_or_hostname())
             && !self.mysql.allow_insecure
         {
             bail!(concat!(
-                "mysql.url doit activer TLS avec require_ssl=true hors machine locale; ",
-                "mysql.allow_insecure=true autorise explicitement une exception"
+                "mysql.url must enable TLS with require_ssl=true for non-loopback hosts; ",
+                "mysql.allow_insecure=true explicitly allows an exception"
             ));
         }
         if self.meilisearch.host.trim().is_empty() {
-            bail!("meilisearch.host est obligatoire");
+            bail!("meilisearch.host is required");
         }
         let meilisearch_url =
-            Url::parse(&self.meilisearch.host).context("parsing de meilisearch.host")?;
+            Url::parse(&self.meilisearch.host).context("parsing meilisearch.host")?;
         if !matches!(meilisearch_url.scheme(), "http" | "https") {
-            bail!("meilisearch.host doit utiliser le schema http ou https");
+            bail!("meilisearch.host must use the http or https scheme");
         }
         let meilisearch_host = meilisearch_url
             .host_str()
-            .context("meilisearch.host doit contenir un nom d'hote")?;
+            .context("meilisearch.host must contain a hostname")?;
         if meilisearch_url.scheme() != "https"
             && !is_loopback_host(meilisearch_host)
             && !self.meilisearch.allow_insecure
         {
             bail!(concat!(
-                "meilisearch.host doit utiliser HTTPS hors machine locale; ",
-                "meilisearch.allow_insecure=true autorise explicitement une exception"
+                "meilisearch.host must use HTTPS for non-loopback hosts; ",
+                "meilisearch.allow_insecure=true explicitly allows an exception"
             ));
         }
         if self.meilisearch.batch_size == 0 {
-            bail!("meilisearch.batch_size doit etre superieur a 0");
+            bail!("meilisearch.batch_size must be greater than 0");
         }
         if self.meilisearch.max_in_flight_tasks == 0 {
-            bail!("meilisearch.max_in_flight_tasks doit etre superieur a 0");
+            bail!("meilisearch.max_in_flight_tasks must be greater than 0");
         }
         if self.tables.is_empty() {
-            bail!("au moins une table doit etre declaree");
+            bail!("at least one table must be configured");
         }
 
         let mut seen_tables = BTreeSet::new();
@@ -188,7 +188,7 @@ impl Config {
             );
             if !seen_tables.insert(key) {
                 bail!(
-                    "table dupliquee dans la configuration: {} -> {}",
+                    "duplicate table in configuration: {} -> {}",
                     table.table,
                     table.index
                 );
@@ -213,17 +213,17 @@ fn read_secret(value_env: &str, file_env: &str) -> Result<Option<String>> {
     let file = read_env(file_env)?;
     let secret = match (value, file) {
         (Some(_), Some(_)) => {
-            bail!("les variables {value_env} et {file_env} ne peuvent pas etre definies ensemble")
+            bail!("{value_env} and {file_env} cannot be set together")
         }
         (Some(value), None) => value,
         (None, Some(path)) => fs::read_to_string(&path)
-            .with_context(|| format!("lecture du secret indique par {file_env}: {path}"))?
+            .with_context(|| format!("reading the secret specified by {file_env}: {path}"))?
             .trim_end_matches(['\r', '\n'])
             .to_owned(),
         (None, None) => return Ok(None),
     };
     if secret.is_empty() {
-        bail!("le secret fourni par {value_env} ou {file_env} est vide");
+        bail!("the secret provided by {value_env} or {file_env} is empty");
     }
     Ok(Some(secret))
 }
@@ -232,7 +232,9 @@ fn read_env(name: &str) -> Result<Option<String>> {
     match env::var(name) {
         Ok(value) => Ok(Some(value)),
         Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => bail!("la variable {name} n'est pas en UTF-8"),
+        Err(env::VarError::NotUnicode(_)) => {
+            bail!("environment variable {name} is not valid UTF-8")
+        }
     }
 }
 
@@ -247,42 +249,42 @@ fn is_loopback_host(host: &str) -> bool {
 impl TableConfig {
     fn validate(&self) -> Result<()> {
         if self.table.trim().is_empty() {
-            bail!("tables[].table est obligatoire");
+            bail!("tables[].table is required");
         }
         if self.index.trim().is_empty() {
-            bail!("tables[].index est obligatoire pour {}", self.table);
+            bail!("tables[].index is required for {}", self.table);
         }
         if self.primary_key.trim().is_empty() {
-            bail!("tables[].primary_key est obligatoire pour {}", self.table);
+            bail!("tables[].primary_key is required for {}", self.table);
         }
         if self.fields.is_empty() {
-            bail!("tables[].fields ne peut pas etre vide pour {}", self.table);
+            bail!("tables[].fields cannot be empty for {}", self.table);
         }
         if !self.fields.iter().any(|field| field == &self.primary_key) {
             bail!(
-                "la cle primaire '{}' doit etre presente dans fields pour {}",
+                "primary key '{}' must be included in fields for {}",
                 self.primary_key,
                 self.table
             );
         }
         if self.snapshot_batch_size == 0 {
             bail!(
-                "snapshot_batch_size doit etre superieur a 0 pour {}",
+                "snapshot_batch_size must be greater than 0 for {}",
                 self.table
             );
         }
         let mut seen_fields = BTreeSet::new();
         for field in &self.fields {
             if field.trim().is_empty() {
-                bail!("nom de champ vide dans {}", self.table);
+                bail!("empty field name in {}", self.table);
             }
             if !seen_fields.insert(field) {
-                bail!("champ duplique dans {}: {}", self.table, field);
+                bail!("duplicate field in {}: {}", self.table, field);
             }
         }
         for field in &self.watch_fields {
             if field.trim().is_empty() {
-                bail!("nom de watch_field vide dans {}", self.table);
+                bail!("empty watch_field name in {}", self.table);
             }
         }
         self.validate_attribute_list("displayed_attributes", self.displayed_attributes.as_deref())?;
@@ -325,7 +327,7 @@ impl TableConfig {
         for attribute in attributes {
             if !seen_attributes.insert(attribute) {
                 bail!(
-                    "attribut duplique dans {} pour {}: {}",
+                    "duplicate attribute in {} for {}: {}",
                     label,
                     self.table,
                     attribute
@@ -342,7 +344,7 @@ impl TableConfig {
         };
         for value in values {
             if value.trim().is_empty() {
-                bail!("valeur vide dans {} pour {}", label, self.table);
+                bail!("empty value in {} for {}", label, self.table);
             }
         }
         Ok(())
@@ -360,7 +362,7 @@ impl TableConfig {
             return Ok(());
         }
         bail!(
-            "attribut '{}' dans {} pour {} absent des champs du document",
+            "attribute '{}' in {} for {} is missing from document fields",
             attribute,
             label,
             self.table
@@ -470,7 +472,7 @@ mod tests {
             .validate()
             .expect_err("attribute should be rejected when the source name is aliased");
 
-        assert!(error.to_string().contains("absent des champs du document"));
+        assert!(error.to_string().contains("missing from document fields"));
     }
 
     #[test]
@@ -482,7 +484,7 @@ mod tests {
             .validate()
             .expect_err("primary key must be part of fields");
 
-        assert!(error.to_string().contains("doit etre presente"));
+        assert!(error.to_string().contains("must be included"));
     }
 
     #[test]
@@ -494,7 +496,7 @@ mod tests {
             .validate()
             .expect_err("duplicate table/index mapping should be rejected");
 
-        assert!(error.to_string().contains("table dupliquee"));
+        assert!(error.to_string().contains("duplicate table"));
     }
 
     #[test]
@@ -518,7 +520,7 @@ mod tests {
             .validate()
             .expect_err("remote Meilisearch without TLS should be rejected");
 
-        assert!(error.to_string().contains("doit utiliser HTTPS"));
+        assert!(error.to_string().contains("must use HTTPS"));
     }
 
     #[test]

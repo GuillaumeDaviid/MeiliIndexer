@@ -161,7 +161,7 @@ fn cli_reports_invalid_config_before_connecting() -> anyhow::Result<()> {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("mysql.url est obligatoire"),
+        stderr.contains("mysql.url is required"),
         "unexpected stderr: {stderr}"
     );
     Ok(())

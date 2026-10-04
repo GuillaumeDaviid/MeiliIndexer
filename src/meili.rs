@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use meilisearch_sdk::{
     client::Client,
     errors::{Error as MeiliError, ErrorCode},
@@ -80,8 +80,9 @@ impl MeiliSink {
         metrics: Option<SyncMetrics>,
     ) -> Result<Self> {
         let client = Client::new(config.host.clone(), config.api_key.as_deref())
-            .context("creation du client Meilisearch")?;
-        info!(sync_run_id, "session de synchronisation demarree");
+            .map_err(sanitize_error)
+            .context("creating the Meilisearch client")?;
+        info!(sync_run_id, "synchronization session started");
         Ok(Self {
             client,
             sync_run_id,
@@ -106,11 +107,13 @@ impl MeiliSink {
 
         let index_exists = self.index_exists(&table.index).await?;
         if preparation.recreate && index_exists {
-            info!(index = %table.index, "suppression de l'index Meilisearch");
+            info!(index = %table.index, "deleting the Meilisearch index");
             let started_at = Instant::now();
             let result = self.client.delete_index(&table.index).await;
             self.record_http_duration(started_at.elapsed());
-            let task = result.with_context(|| format!("suppression de l'index {}", table.index))?;
+            let task = result
+                .map_err(sanitize_error)
+                .with_context(|| format!("deleting index {}", table.index))?;
             self.wait_for_task(task).await?;
         }
 
@@ -118,7 +121,7 @@ impl MeiliSink {
             info!(
                 index = %table.index,
                 primary_key = %table.primary_key,
-                "creation de l'index Meilisearch"
+                "creating the Meilisearch index"
             );
             let started_at = Instant::now();
             let result = self
@@ -126,15 +129,18 @@ impl MeiliSink {
                 .create_index(&table.index, Some(&table.primary_key))
                 .await;
             self.record_http_duration(started_at.elapsed());
-            let task = result.with_context(|| format!("creation de l'index {}", table.index))?;
+            let task = result
+                .map_err(sanitize_error)
+                .with_context(|| format!("creating index {}", table.index))?;
             self.wait_for_task(task).await?;
         } else if preparation.clear_documents {
-            info!(index = %table.index, "suppression des documents Meilisearch");
+            info!(index = %table.index, "deleting Meilisearch documents");
             let started_at = Instant::now();
             let result = self.client.index(&table.index).delete_all_documents().await;
             self.record_http_duration(started_at.elapsed());
             let task = result
-                .with_context(|| format!("suppression des documents dans {}", table.index))?;
+                .map_err(sanitize_error)
+                .with_context(|| format!("deleting documents in {}", table.index))?;
             self.wait_for_task(task).await?;
         }
 
@@ -329,9 +335,9 @@ impl MeiliSink {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_task_failure(document_values.len());
                 }
-                return Err(error).with_context(|| {
+                return Err(sanitize_error(error)).with_context(|| {
                     format!(
-                        "envoi de {} documents vers {}",
+                        "sending {} documents to {}",
                         document_values.len(),
                         key.index_uid
                     )
@@ -371,9 +377,9 @@ impl MeiliSink {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_task_failure(document_ids.len());
                 }
-                return Err(error).with_context(|| {
+                return Err(sanitize_error(error)).with_context(|| {
                     format!(
-                        "suppression de {} documents dans {}",
+                        "deleting {} documents in {}",
                         document_ids.len(),
                         key.index_uid
                     )
@@ -391,7 +397,9 @@ impl MeiliSink {
         match result {
             Ok(_) => Ok(true),
             Err(error) if is_index_not_found(&error) => Ok(false),
-            Err(error) => Err(error).with_context(|| format!("lecture de l'index {index_uid}")),
+            Err(error) => {
+                Err(sanitize_error(error)).with_context(|| format!("reading index {index_uid}"))
+            }
         }
     }
 
@@ -404,7 +412,9 @@ impl MeiliSink {
             .set_settings(&settings)
             .await;
         self.record_http_duration(started_at.elapsed());
-        let task = result.with_context(|| format!("configuration de l'index {}", table.index))?;
+        let task = result
+            .map_err(sanitize_error)
+            .with_context(|| format!("configuring index {}", table.index))?;
         self.wait_for_task(task).await
     }
 
@@ -433,7 +443,7 @@ impl MeiliSink {
             primary_key = %key.primary_key,
             documents = document_ids.len(),
             event_ids = ?event_ids,
-            "lot de synchronisation soumis a Meilisearch"
+            "synchronization batch submitted to Meilisearch"
         );
         for event_id in &event_ids {
             info!(
@@ -441,7 +451,7 @@ impl MeiliSink {
                 batch_id,
                 event_id,
                 meilisearch_task_uid = task.task_uid,
-                "evenement CDC rattache a la tache Meilisearch"
+                "CDC event associated with the Meilisearch task"
             );
         }
         self.in_flight.push_back(PendingSyncTask {
@@ -457,7 +467,7 @@ impl MeiliSink {
             let task = self
                 .in_flight
                 .pop_front()
-                .context("file de taches Meilisearch incoherente")?;
+                .context("inconsistent Meilisearch task queue")?;
             let started_at = Instant::now();
             let result = self.wait_for_sync_task(task).await;
             if let Some(metrics) = &self.metrics {
@@ -478,18 +488,17 @@ impl MeiliSink {
                 batch_id = task.batch_id,
                 meilisearch_task_uid = task_uid,
                 error_code = %failure.error_code,
-                error_message = %failure.error_message,
                 operation = task.operation.as_str(),
                 index = %task.index_uid,
                 primary_key = %task.primary_key,
                 documents = task.document_ids.len(),
                 event_ids = ?task.event_ids,
-                "tache Meilisearch echouee"
+                "Meilisearch task failed"
             );
             if let Some(metrics) = &self.metrics {
                 metrics.record_task_failure(task.document_ids.len());
             }
-            bail!("tache Meilisearch {task_uid} en echec: {failure}");
+            return Err(task_failure(task_uid, &failure.error_code));
         }
         info!(
             sync_run_id = %self.sync_run_id,
@@ -500,7 +509,7 @@ impl MeiliSink {
             primary_key = %task.primary_key,
             documents = task.document_ids.len(),
             event_ids = ?task.event_ids,
-            "tache Meilisearch terminee avec succes"
+            "Meilisearch task completed successfully"
         );
         if let Some(metrics) = &self.metrics {
             metrics.record_task_success(task.document_ids.len());
@@ -516,10 +525,9 @@ impl MeiliSink {
             error!(
                 meilisearch_task_uid = task_uid,
                 error_code = %failure.error_code,
-                error_message = %failure.error_message,
-                "tache Meilisearch echouee"
+                "Meilisearch task failed"
             );
-            bail!("tache Meilisearch {task_uid} en echec: {failure}");
+            return Err(task_failure(task_uid, &failure.error_code));
         }
         Ok(())
     }
@@ -534,8 +542,36 @@ impl MeiliSink {
         if let Some(metrics) = &self.metrics {
             metrics.record_meilisearch_task_wait(started_at.elapsed());
         }
-        result.with_context(|| format!("attente de la tache Meilisearch {task_uid}"))
+        result
+            .map_err(sanitize_error)
+            .with_context(|| format!("waiting for Meilisearch task {task_uid}"))
     }
+}
+
+// SDK errors can embed documents, document IDs, HTTP bodies, and URLs.
+// Discard their sources as well, since anyhow prints the complete error chain.
+fn sanitize_error(error: MeiliError) -> anyhow::Error {
+    match error {
+        MeiliError::Meilisearch(error) => {
+            anyhow::anyhow!("Meilisearch error (code: {})", error.error_code)
+        }
+        MeiliError::MeilisearchCommunication(error) => anyhow::anyhow!(
+            "Meilisearch communication error (HTTP {})",
+            error.status_code
+        ),
+        MeiliError::Timeout => anyhow::anyhow!("Meilisearch task wait timed out"),
+        MeiliError::HttpError(error) if error.is_timeout() => {
+            anyhow::anyhow!("Meilisearch HTTP request timed out")
+        }
+        MeiliError::HttpError(_) => anyhow::anyhow!("Meilisearch HTTP request failed"),
+        MeiliError::ParseError(_) => anyhow::anyhow!("invalid Meilisearch JSON response"),
+        MeiliError::InvalidRequest => anyhow::anyhow!("invalid Meilisearch request"),
+        _ => anyhow::anyhow!("Meilisearch client failed"),
+    }
+}
+
+fn task_failure(task_uid: u32, error_code: &ErrorCode) -> anyhow::Error {
+    anyhow::anyhow!("Meilisearch task {task_uid} failed (code: {error_code})")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -576,7 +612,7 @@ fn event_ids<'a>(event_ids: impl Iterator<Item = &'a str>) -> Vec<String> {
 
 fn document_id(document: &JsonValue, primary_key: &str) -> String {
     document.get(primary_key).map_or_else(
-        || format!("<cle '{primary_key}' absente>"),
+        || format!("<missing key '{primary_key}'>"),
         JsonValue::to_string,
     )
 }
@@ -612,4 +648,157 @@ fn is_index_not_found(error: &MeiliError) -> bool {
         error,
         MeiliError::Meilisearch(error) if error.error_code == ErrorCode::IndexNotFound
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+    };
+
+    use meilisearch_sdk::errors::{ErrorType, MeilisearchCommunicationError, MeilisearchError};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn api_errors_discard_payloads_and_error_sources() {
+        let error = MeiliError::Meilisearch(MeilisearchError {
+            error_message: "Document: {email: private@example.com}".into(),
+            error_code: ErrorCode::MissingDocumentId,
+            error_type: ErrorType::InvalidRequest,
+            error_link: "https://example.com/private-id".into(),
+        });
+        let error = sanitize_error(error).context("submission failed");
+        let output = format!("{error:#?} {error:#}");
+        assert!(output.contains("missing_document_id"));
+        assert!(!output.contains("private"));
+    }
+
+    #[test]
+    fn communication_errors_discard_body_and_url() {
+        let error = MeiliError::MeilisearchCommunication(MeilisearchCommunicationError {
+            status_code: 500,
+            message: Some("private-document".into()),
+            url: "https://example.com/documents/private-id".into(),
+        });
+        let error = sanitize_error(error);
+        let output = format!("{error:#?} {error:#}");
+        assert!(output.contains("HTTP 500"));
+        assert!(!output.contains("private"));
+        assert!(!output.contains("https://"));
+    }
+
+    #[derive(Clone)]
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Exercise the SDK polling path and both task-failure reporting paths without real services.
+    #[tokio::test]
+    async fn failed_tasks_do_not_expose_documents_in_logs_or_errors() -> Result<()> {
+        let payload = json!({
+            "uid": 7, "indexUid": "products", "status": "failed",
+            "type": "documentAdditionOrUpdate", "duration": "PT0.001S",
+            "enqueuedAt": "2026-10-04T00:00:00Z", "startedAt": "2026-10-04T00:00:00Z",
+            "finishedAt": "2026-10-04T00:00:00Z",
+            "error": { "message": "Document: {email: private@example.com}",
+                "code": "missing_document_id", "type": "invalid_request",
+                "link": "https://example.com/private-id" }
+        })
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let host = format!("http://{}", listener.local_addr()?);
+        let server = thread::spawn(move || -> std::io::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for _ in 0..4 {
+                let mut socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                };
+                socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte)?;
+                    request.push(byte[0]);
+                }
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )?;
+            }
+            Ok(())
+        });
+        let logs = LogWriter(Arc::new(Mutex::new(Vec::new())));
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let sink = MeiliSink::new(
+            &MeilisearchConfig {
+                host,
+                task_timeout_secs: 2,
+                ..MeilisearchConfig::default()
+            },
+            "test-run".into(),
+            None,
+        )?;
+        let task: TaskInfo = serde_json::from_value(json!({
+            "taskUid": 7, "indexUid": "products", "status": "enqueued",
+            "type": "documentAdditionOrUpdate", "enqueuedAt": "2026-10-04T00:00:00Z"
+        }))?;
+        let preparation_error = sink
+            .wait_for_task(task.clone())
+            .await
+            .expect_err("task must fail");
+        let sync_error = sink
+            .wait_for_sync_task(PendingSyncTask {
+                task,
+                batch_id: 1,
+                index_uid: "products".into(),
+                primary_key: "id".into(),
+                operation: OperationKind::Upsert,
+                document_ids: vec!["private-id".into()],
+                event_ids: vec!["mysql-bin.000001:100".into()],
+            })
+            .await
+            .expect_err("sync task must fail");
+        server.join().expect("mock server panicked")?;
+        let output = format!(
+            "{preparation_error:#?} {sync_error:#?} {}",
+            String::from_utf8(logs.0.lock().expect("log buffer poisoned").clone())?
+        );
+        assert!(output.contains("missing_document_id"));
+        assert!(!output.contains("private"));
+        Ok(())
+    }
 }
