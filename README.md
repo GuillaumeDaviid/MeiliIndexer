@@ -127,3 +127,7 @@ docker stop meili-mysql-sync
 See the [documentation](docs/README.md) for configuration reference,
 production deployment, commands, recovery, metrics, synchronization behavior,
 and benchmarks.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
