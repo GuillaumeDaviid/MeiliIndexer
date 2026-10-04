@@ -1,5 +1,7 @@
 /target/
 /config.toml
+*.secret
 /meili-sync-state.json
 /.docker-run/
 /.cargo-target-codex/
+/benchmarks/

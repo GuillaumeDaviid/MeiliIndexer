@@ -164,12 +164,16 @@ impl SyncMetrics {
         if let Some(sampler) = sampler {
             let _ = sampler.join();
         }
-        self.emit(duration, "terminee", "terminee");
+        self.emit(duration, "finished", "finished");
     }
 
     #[allow(clippy::cast_precision_loss)]
     pub fn report_progress(&self) {
-        self.emit(self.inner.started_at.elapsed(), "en cours", "en cours");
+        self.emit(
+            self.inner.started_at.elapsed(),
+            "in progress",
+            "in progress",
+        );
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -207,7 +211,7 @@ impl SyncMetrics {
             rss_bytes = state.rss_bytes,
             virtual_memory_bytes = state.virtual_memory_bytes,
             peak_rss_bytes = state.peak_rss_bytes,
-            "synchronisation {sync_status}"
+            "synchronization {sync_status}"
         );
         info!(
             sync_run_id = %self.inner.sync_run_id,
@@ -219,7 +223,7 @@ impl SyncMetrics {
             meilisearch_http_ms = duration_to_millis(state.meilisearch_http),
             meilisearch_task_wait_ms = duration_to_millis(state.meilisearch_task_wait),
             checkpoint_write_ms = duration_to_millis(state.checkpoint_write),
-            "repartition du temps de synchronisation {timing_status}"
+            "synchronization timing breakdown {timing_status}"
         );
     }
 

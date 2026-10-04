@@ -16,7 +16,7 @@ use uuid::Uuid;
 #[derive(Debug, Parser)]
 #[command(
     version,
-    about = "Synchronise des tables MySQL vers Meilisearch via snapshot + binlog"
+    about = "Synchronize MySQL tables to Meilisearch using a snapshot and binlog"
 )]
 struct Cli {
     #[arg(short, long, default_value = "config.toml")]
@@ -24,7 +24,7 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Affiche les metriques de performance a la fin"
+        help = "Report performance metrics during CDC and at completion"
     )]
     metrics: bool,
     #[command(subcommand)]
@@ -78,7 +78,9 @@ async fn main() -> Result<()> {
         Command::Position => {
             let position = current_binlog_position(&pool).await?;
             println!("{}:{}", position.file, position.pos);
-            pool.disconnect().await.context("fermeture du pool MySQL")?;
+            pool.disconnect()
+                .await
+                .context("disconnecting the MySQL pool")?;
             return Ok(());
         }
     };
@@ -121,7 +123,7 @@ async fn main() -> Result<()> {
                     result?;
                     position
                 } else {
-                    state.context("etat absent")?.binlog
+                    state.context("state missing")?.binlog
                 };
                 cdc::run(&config, &pool, &plans, &mut sink, start, metrics.as_ref()).await
             }
@@ -151,26 +153,29 @@ async fn main() -> Result<()> {
                         Some(state) => state.binlog,
                         None => current_binlog_position(&pool).await?,
                     },
-                    _ => anyhow::bail!("--file et --pos doivent etre fournis ensemble"),
+                    _ => anyhow::bail!("--file and --pos must be provided together"),
                 };
                 let mut sink =
                     MeiliSink::new(&config.meilisearch, sync_run_id.clone(), metrics.clone())?;
                 cdc::run(&config, &pool, &plans, &mut sink, start, metrics.as_ref()).await
             }
             Command::Position => {
-                unreachable!("position est traite avant l'initialisation des metriques")
+                unreachable!("position is handled before metrics initialization")
             }
         }
     }
     .await;
 
-    let disconnect_result = pool.disconnect().await.context("fermeture du pool MySQL");
+    let disconnect_result = pool
+        .disconnect()
+        .await
+        .context("disconnecting the MySQL pool");
     if let Some(metrics) = metrics {
         metrics.finish();
     }
     result?;
     disconnect_result?;
-    info!("termine");
+    info!("finished");
     Ok(())
 }
 

@@ -1,10 +1,11 @@
 [mysql]
-url = "mysql://sync_user:sync_password@127.0.0.1:3306/football_data"
+# In production, provide the full URL through MEILI_SYNC_MYSQL_URL_FILE.
+url = "mysql://sync_user@127.0.0.1:3306/football_data"
 server_id = 7101
 
 [meilisearch]
 host = "http://127.0.0.1:7700"
-api_key = "masterKey"
+# Provide a restricted API key through MEILI_SYNC_MEILISEARCH_API_KEY_FILE.
 batch_size = 50000
 max_in_flight_tasks = 4
 task_poll_ms = 100

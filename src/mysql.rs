@@ -114,7 +114,7 @@ impl TablePlan {
             .cloned()
             .with_context(|| {
                 format!(
-                    "cle primaire '{}' absente du resultat",
+                    "primary key '{}' missing from the result",
                     self.config.primary_key
                 )
             })
@@ -125,7 +125,7 @@ impl TablePlan {
         for (index, field) in self.config.fields.iter().enumerate() {
             let value = row
                 .as_ref(index)
-                .with_context(|| format!("champ '{field}' absent du resultat"))?;
+                .with_context(|| format!("field '{field}' missing from the result"))?;
             document.insert(
                 self.config.target_field(field).to_owned(),
                 mysql_value_to_json(value),
@@ -136,23 +136,23 @@ impl TablePlan {
 }
 
 pub fn create_pool(config: &Config) -> Result<Pool> {
-    let opts = Opts::from_url(&config.mysql.url).context("parsing de mysql.url")?;
+    let opts = Opts::from_url(&config.mysql.url).context("parsing mysql.url")?;
     Ok(Pool::new(opts))
 }
 
 pub async fn load_table_plans(config: &Config, pool: &Pool) -> Result<Vec<TablePlan>> {
-    let opts = Opts::from_url(&config.mysql.url).context("parsing de mysql.url")?;
+    let opts = Opts::from_url(&config.mysql.url).context("parsing mysql.url")?;
     let default_database = opts.db_name().map(ToOwned::to_owned);
     let mut conn = pool
         .get_conn()
         .await
-        .context("connexion MySQL pour charger les schemas")?;
+        .context("connecting to MySQL to load schemas")?;
     let mut plans = Vec::with_capacity(config.tables.len());
 
     for table in &config.tables {
         let Some(database) = table.database.clone().or_else(|| default_database.clone()) else {
             bail!(
-                "aucune base MySQL par defaut dans l'URL; renseigner database pour {}",
+                "no default MySQL database in the URL; set database for {}",
                 table.table
             );
         };
@@ -162,7 +162,7 @@ pub async fn load_table_plans(config: &Config, pool: &Pool) -> Result<Vec<TableP
             .fields
             .iter()
             .position(|field| field == &table.primary_key)
-            .with_context(|| format!("cle primaire absente des champs de {}", table.table))?;
+            .with_context(|| format!("primary key missing from fields of {}", table.table))?;
         plans.push(TablePlan {
             key: TableKey {
                 database,
@@ -191,9 +191,9 @@ async fn load_table_schema(
             (database, table),
         )
         .await
-        .with_context(|| format!("lecture du schema de {database}.{table}"))?;
+        .with_context(|| format!("reading the schema of {database}.{table}"))?;
     if rows.is_empty() {
-        bail!("table introuvable dans information_schema: {database}.{table}");
+        bail!("table not found in information_schema: {database}.{table}");
     }
     Ok(TableSchema { columns: rows })
 }
@@ -201,20 +201,12 @@ async fn load_table_schema(
 fn validate_table_fields(table: &TableConfig, schema: &TableSchema) -> Result<()> {
     for field in &table.fields {
         if !schema.columns.iter().any(|column| column == field) {
-            bail!(
-                "champ '{}' introuvable dans la table {}",
-                field,
-                table.table
-            );
+            bail!("field '{}' not found in table {}", field, table.table);
         }
     }
     for field in &table.watch_fields {
         if !schema.columns.iter().any(|column| column == field) {
-            bail!(
-                "watch_field '{}' introuvable dans la table {}",
-                field,
-                table.table
-            );
+            bail!("watch_field '{}' not found in table {}", field, table.table);
         }
     }
     if !schema
@@ -223,7 +215,7 @@ fn validate_table_fields(table: &TableConfig, schema: &TableSchema) -> Result<()
         .any(|column| column == &table.primary_key)
     {
         bail!(
-            "cle primaire '{}' introuvable dans la table {}",
+            "primary key '{}' not found in table {}",
             table.primary_key,
             table.table
         );
@@ -235,7 +227,7 @@ pub async fn current_binlog_position(pool: &Pool) -> Result<BinlogPosition> {
     let mut conn = pool
         .get_conn()
         .await
-        .context("connexion MySQL pour lire la position binlog")?;
+        .context("connecting to MySQL to read the binlog position")?;
 
     match read_binlog_position_with(&mut conn, "SHOW BINARY LOG STATUS").await {
         Ok(position) => Ok(position),
@@ -243,7 +235,7 @@ pub async fn current_binlog_position(pool: &Pool) -> Result<BinlogPosition> {
             .await
             .with_context(|| {
                 format!(
-                    "SHOW BINARY LOG STATUS a echoue avant le fallback SHOW MASTER STATUS: {first_error}"
+                    "SHOW BINARY LOG STATUS failed before falling back to SHOW MASTER STATUS: {first_error}"
                 )
             }),
     }
@@ -256,13 +248,13 @@ async fn read_binlog_position_with(
     let row: Row = conn
         .query_first(statement)
         .await?
-        .with_context(|| format!("{statement} n'a retourne aucune ligne"))?;
+        .with_context(|| format!("{statement} returned no rows"))?;
     let file = row
         .get::<String, _>(0)
-        .with_context(|| format!("{statement}: colonne File illisible"))?;
+        .with_context(|| format!("{statement}: cannot read the File column"))?;
     let pos = row
         .get::<u64, _>(1)
-        .with_context(|| format!("{statement}: colonne Position illisible"))?;
+        .with_context(|| format!("{statement}: cannot read the Position column"))?;
     Ok(BinlogPosition { file, pos })
 }
 
@@ -291,13 +283,13 @@ async fn snapshot_table(
         table = %plan.key.table,
         database = %plan.key.database,
         index = %plan.config.index,
-        "demarrage du snapshot"
+        "snapshot started"
     );
 
     let mut conn = pool
         .get_conn()
         .await
-        .with_context(|| format!("connexion MySQL pour snapshot {}", plan.key.table))?;
+        .with_context(|| format!("connecting to MySQL for snapshot of {}", plan.key.table))?;
     let mut last_pk = None;
     let mut documents = Vec::with_capacity(
         sink.batch_size()
@@ -322,7 +314,8 @@ async fn snapshot_table(
         if let Some(metrics) = metrics {
             metrics.record_mysql_read(started_at.elapsed());
         }
-        let mut result = result.with_context(|| format!("requete snapshot {}", plan.key.table))?;
+        let mut result =
+            result.with_context(|| format!("querying snapshot of {}", plan.key.table))?;
 
         let mut rows_in_batch = 0_usize;
         loop {
@@ -335,7 +328,6 @@ async fn snapshot_table(
                 break;
             };
             let pk = plan.row_primary_key(&row)?;
-            let document_id = mysql_value_to_document_id(&pk);
             let started_at = Instant::now();
             let document = plan.row_to_document(&row)?;
             if let Some(metrics) = metrics {
@@ -348,9 +340,7 @@ async fn snapshot_table(
                 source_table = %plan.key.table,
                 index = %plan.config.index,
                 primary_key = %plan.config.primary_key,
-                document_id = %document_id,
-                document = %document,
-                "document ajoute au lot de synchronisation"
+                "document added to the synchronization batch"
             );
             documents.push(document);
             last_pk = Some(pk);
@@ -373,7 +363,7 @@ async fn snapshot_table(
         table = %plan.key.table,
         database = %plan.key.database,
         rows = total_rows,
-        "snapshot termine"
+        "snapshot completed"
     );
     Ok(())
 }
@@ -401,7 +391,7 @@ pub async fn fetch_document_by_pk(
     let mut conn = pool
         .get_conn()
         .await
-        .with_context(|| format!("connexion MySQL pour relire {}", plan.key.table))?;
+        .with_context(|| format!("connecting to MySQL to reread {}", plan.key.table))?;
     let started_at = Instant::now();
     let result = conn
         .exec_first::<Row, _, _>(
@@ -412,7 +402,7 @@ pub async fn fetch_document_by_pk(
     if let Some(metrics) = metrics {
         metrics.record_mysql_read(started_at.elapsed());
     }
-    let row = result.with_context(|| format!("relecture de {}", plan.key.table))?;
+    let row = result.with_context(|| format!("rereading {}", plan.key.table))?;
     let started_at = Instant::now();
     let document = row
         .as_ref()
@@ -460,7 +450,11 @@ pub fn operation_from_rows(
             let document = after.to_document(&plan.config);
             Ok(RowOperation::Upsert {
                 document,
-                primary_key: after.primary_key(&plan.config.primary_key)?,
+                primary_key: after
+                    .value(&plan.config.primary_key)
+                    .or_else(|| before.value(&plan.config.primary_key))
+                    .cloned()
+                    .context("primary key missing from both binlog update row images")?,
                 needs_fetch: plan.config.where_clause.is_some()
                     || !after.has_all_document_fields(&plan.config),
                 previous_id,
@@ -484,16 +478,14 @@ pub enum RowOperation {
     Ignored,
 }
 
-#[must_use]
-pub fn find_plan_for_table<'a>(
+pub fn plans_for_table<'a>(
     plans: &'a [TablePlan],
-    table_map_event: &TableMapEvent<'_>,
-) -> Option<&'a TablePlan> {
-    let database = table_map_event.database_name();
-    let table = table_map_event.table_name();
+    database: &'a str,
+    table: &'a str,
+) -> impl Iterator<Item = &'a TablePlan> + 'a {
     plans
         .iter()
-        .find(|plan| plan.matches(database.as_ref(), table.as_ref()))
+        .filter(move |plan| plan.matches(database, table))
 }
 
 pub fn rows_event_rows<'a>(
@@ -522,13 +514,13 @@ impl RowImage {
     fn primary_key(&self, primary_key: &str) -> Result<MySqlValue> {
         self.value(primary_key)
             .cloned()
-            .with_context(|| format!("cle primaire '{primary_key}' absente de l'evenement binlog"))
+            .with_context(|| format!("primary key '{primary_key}' missing from the binlog event"))
     }
 
     fn document_id(&self, primary_key: &str) -> Result<String> {
         self.value(primary_key)
             .map(mysql_value_to_document_id)
-            .with_context(|| format!("cle primaire '{primary_key}' absente de l'evenement binlog"))
+            .with_context(|| format!("primary key '{primary_key}' missing from the binlog event"))
     }
 
     fn has_all_document_fields(&self, table: &TableConfig) -> bool {
@@ -572,7 +564,7 @@ fn binlog_row_to_image(row: &BinlogRow, schema: &TableSchema) -> Result<RowImage
         let column_name = resolve_binlog_column_name(column.name_str().as_ref(), schema)?;
         let value = match row.as_ref(index) {
             Some(value) => binlog_value_to_mysql_value(value)
-                .with_context(|| format!("conversion de la colonne binlog '{column_name}'"))?,
+                .with_context(|| format!("converting binlog column '{column_name}'"))?,
             None => None,
         };
         values.insert(column_name, value);
@@ -593,12 +585,12 @@ fn resolve_binlog_column_name(raw_name: &str, schema: &TableSchema) -> Result<St
     if let Some(raw_index) = raw_name.strip_prefix('@') {
         let index = raw_index
             .parse::<usize>()
-            .with_context(|| format!("nom de colonne binlog invalide: {raw_name}"))?;
+            .with_context(|| format!("invalid binlog column name: {raw_name}"))?;
         return schema
             .columns
             .get(index)
             .cloned()
-            .with_context(|| format!("index de colonne binlog hors limites: {raw_name}"));
+            .with_context(|| format!("binlog column index out of bounds: {raw_name}"));
     }
     Ok(raw_name.to_owned())
 }
@@ -618,6 +610,94 @@ pub fn plans_by_table(plans: &[TablePlan]) -> HashMap<TableKey, TablePlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mysql_async::{Column, consts::ColumnType};
+
+    fn test_plan(index: &str) -> TablePlan {
+        TablePlan {
+            key: TableKey {
+                database: "shop".into(),
+                table: "products".into(),
+            },
+            config: TableConfig {
+                table: "products".into(),
+                index: index.into(),
+                primary_key: "id".into(),
+                fields: vec!["id".into(), "name".into()],
+                ..TableConfig::default()
+            },
+            schema: TableSchema {
+                columns: vec!["id".into(), "name".into()],
+            },
+            primary_key_select_index: 0,
+        }
+    }
+
+    fn binlog_row(values: &[(&str, MySqlValue)]) -> BinlogRow {
+        let columns = values
+            .iter()
+            .map(|(name, _)| Column::new(ColumnType::MYSQL_TYPE_LONG).with_name(name.as_bytes()))
+            .collect::<Vec<_>>();
+        let values = values
+            .iter()
+            .map(|(_, value)| Some(BinlogValue::Value(value.clone())))
+            .collect();
+        BinlogRow::new(values, columns.into())
+    }
+
+    #[test]
+    fn minimal_update_uses_primary_key_from_before_image() -> Result<()> {
+        let plan = test_plan("products");
+        let before = binlog_row(&[("@0", MySqlValue::Int(42))]);
+        let after = binlog_row(&[("@1", MySqlValue::Bytes(b"updated".to_vec()))]);
+        let operation = operation_from_rows(&plan, Some(&before), Some(&after))?;
+        let RowOperation::Upsert {
+            primary_key,
+            needs_fetch,
+            previous_id,
+            ..
+        } = operation
+        else {
+            panic!("a minimal update must produce an upsert");
+        };
+        assert_eq!(primary_key, MySqlValue::Int(42));
+        assert!(needs_fetch);
+        assert_eq!(previous_id.as_deref(), Some("42"));
+        Ok(())
+    }
+
+    #[test]
+    fn changed_primary_key_prefers_after_image() -> Result<()> {
+        let plan = test_plan("products");
+        let before = binlog_row(&[("id", MySqlValue::Int(42))]);
+        let after = binlog_row(&[("id", MySqlValue::Int(43))]);
+        let RowOperation::Upsert {
+            primary_key,
+            previous_id,
+            ..
+        } = operation_from_rows(&plan, Some(&before), Some(&after))?
+        else {
+            panic!("a primary key change must produce an upsert");
+        };
+        assert_eq!(primary_key, MySqlValue::Int(43));
+        assert_eq!(previous_id.as_deref(), Some("42"));
+        Ok(())
+    }
+
+    #[test]
+    fn table_routing_includes_every_configured_index() {
+        let mut unrelated = test_plan("unrelated");
+        unrelated.key.database = "other_shop".into();
+        let plans = [
+            test_plan("products"),
+            unrelated,
+            test_plan("products_public"),
+        ];
+        let indexes = plans_for_table(&plans, "shop", "products")
+            .map(|plan| plan.config.index.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(indexes, ["products", "products_public"]);
+        assert_eq!(plans_for_table(&plans, "shop", "unknown").count(), 0);
+    }
 
     #[test]
     fn resolves_default_binlog_column_name() {

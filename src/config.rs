@@ -1,13 +1,21 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    env, fs,
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
+use mysql_async::Opts;
 use serde::Deserialize;
+use url::Url;
 
-#[derive(Debug, Clone, Deserialize)]
+const MYSQL_URL_ENV: &str = "MEILI_SYNC_MYSQL_URL";
+const MYSQL_URL_FILE_ENV: &str = "MEILI_SYNC_MYSQL_URL_FILE";
+const MEILISEARCH_API_KEY_ENV: &str = "MEILI_SYNC_MEILISEARCH_API_KEY";
+const MEILISEARCH_API_KEY_FILE_ENV: &str = "MEILI_SYNC_MEILISEARCH_API_KEY_FILE";
+
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub mysql: MysqlConfig,
     pub meilisearch: MeilisearchConfig,
@@ -16,17 +24,20 @@ pub struct Config {
     pub tables: Vec<TableConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct MysqlConfig {
     pub url: String,
     pub server_id: u32,
+    #[serde(default)]
+    pub allow_insecure: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default)]
 pub struct MeilisearchConfig {
     pub host: String,
     pub api_key: Option<String>,
+    pub allow_insecure: bool,
     pub batch_size: usize,
     pub max_in_flight_tasks: usize,
     pub task_poll_ms: u64,
@@ -38,6 +49,7 @@ impl Default for MeilisearchConfig {
         Self {
             host: String::new(),
             api_key: None,
+            allow_insecure: false,
             batch_size: 1_000,
             max_in_flight_tasks: 8,
             task_poll_ms: 100,
@@ -111,31 +123,59 @@ impl Default for TableConfig {
 impl Config {
     pub fn from_path(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
-            .with_context(|| format!("lecture de la configuration {}", path.display()))?;
-        let config: Self = toml::from_str(&content)
-            .with_context(|| format!("parsing TOML de {}", path.display()))?;
+            .with_context(|| format!("reading configuration {}", path.display()))?;
+        let mut config: Self = toml::from_str(&content)
+            .with_context(|| format!("parsing TOML in {}", path.display()))?;
+        config.apply_env_overrides()?;
         config.validate()?;
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<()> {
         if self.mysql.url.trim().is_empty() {
-            bail!("mysql.url est obligatoire");
+            bail!("mysql.url is required");
         }
         if self.mysql.server_id == 0 {
-            bail!("mysql.server_id doit etre unique et superieur a 0");
+            bail!("mysql.server_id must be unique and greater than 0");
+        }
+        let mysql_opts = Opts::from_url(&self.mysql.url).context("parsing mysql.url")?;
+        if mysql_opts.ssl_opts().is_none()
+            && !is_loopback_host(mysql_opts.ip_or_hostname())
+            && !self.mysql.allow_insecure
+        {
+            bail!(concat!(
+                "mysql.url must enable TLS with require_ssl=true for non-loopback hosts; ",
+                "mysql.allow_insecure=true explicitly allows an exception"
+            ));
         }
         if self.meilisearch.host.trim().is_empty() {
-            bail!("meilisearch.host est obligatoire");
+            bail!("meilisearch.host is required");
+        }
+        let meilisearch_url =
+            Url::parse(&self.meilisearch.host).context("parsing meilisearch.host")?;
+        if !matches!(meilisearch_url.scheme(), "http" | "https") {
+            bail!("meilisearch.host must use the http or https scheme");
+        }
+        let meilisearch_host = meilisearch_url
+            .host_str()
+            .context("meilisearch.host must contain a hostname")?;
+        if meilisearch_url.scheme() != "https"
+            && !is_loopback_host(meilisearch_host)
+            && !self.meilisearch.allow_insecure
+        {
+            bail!(concat!(
+                "meilisearch.host must use HTTPS for non-loopback hosts; ",
+                "meilisearch.allow_insecure=true explicitly allows an exception"
+            ));
         }
         if self.meilisearch.batch_size == 0 {
-            bail!("meilisearch.batch_size doit etre superieur a 0");
+            bail!("meilisearch.batch_size must be greater than 0");
         }
         if self.meilisearch.max_in_flight_tasks == 0 {
-            bail!("meilisearch.max_in_flight_tasks doit etre superieur a 0");
+            bail!("meilisearch.max_in_flight_tasks must be greater than 0");
         }
         if self.tables.is_empty() {
-            bail!("au moins une table doit etre declaree");
+            bail!("at least one table must be configured");
         }
 
         let mut seen_tables = BTreeSet::new();
@@ -148,7 +188,7 @@ impl Config {
             );
             if !seen_tables.insert(key) {
                 bail!(
-                    "table dupliquee dans la configuration: {} -> {}",
+                    "duplicate table in configuration: {} -> {}",
                     table.table,
                     table.index
                 );
@@ -156,47 +196,95 @@ impl Config {
         }
         Ok(())
     }
+
+    fn apply_env_overrides(&mut self) -> Result<()> {
+        if let Some(url) = read_secret(MYSQL_URL_ENV, MYSQL_URL_FILE_ENV)? {
+            self.mysql.url = url;
+        }
+        if let Some(api_key) = read_secret(MEILISEARCH_API_KEY_ENV, MEILISEARCH_API_KEY_FILE_ENV)? {
+            self.meilisearch.api_key = Some(api_key);
+        }
+        Ok(())
+    }
+}
+
+fn read_secret(value_env: &str, file_env: &str) -> Result<Option<String>> {
+    let value = read_env(value_env)?;
+    let file = read_env(file_env)?;
+    let secret = match (value, file) {
+        (Some(_), Some(_)) => {
+            bail!("{value_env} and {file_env} cannot be set together")
+        }
+        (Some(value), None) => value,
+        (None, Some(path)) => fs::read_to_string(&path)
+            .with_context(|| format!("reading the secret specified by {file_env}: {path}"))?
+            .trim_end_matches(['\r', '\n'])
+            .to_owned(),
+        (None, None) => return Ok(None),
+    };
+    if secret.is_empty() {
+        bail!("the secret provided by {value_env} or {file_env} is empty");
+    }
+    Ok(Some(secret))
+}
+
+fn read_env(name: &str) -> Result<Option<String>> {
+    match env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            bail!("environment variable {name} is not valid UTF-8")
+        }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 impl TableConfig {
     fn validate(&self) -> Result<()> {
         if self.table.trim().is_empty() {
-            bail!("tables[].table est obligatoire");
+            bail!("tables[].table is required");
         }
         if self.index.trim().is_empty() {
-            bail!("tables[].index est obligatoire pour {}", self.table);
+            bail!("tables[].index is required for {}", self.table);
         }
         if self.primary_key.trim().is_empty() {
-            bail!("tables[].primary_key est obligatoire pour {}", self.table);
+            bail!("tables[].primary_key is required for {}", self.table);
         }
         if self.fields.is_empty() {
-            bail!("tables[].fields ne peut pas etre vide pour {}", self.table);
+            bail!("tables[].fields cannot be empty for {}", self.table);
         }
         if !self.fields.iter().any(|field| field == &self.primary_key) {
             bail!(
-                "la cle primaire '{}' doit etre presente dans fields pour {}",
+                "primary key '{}' must be included in fields for {}",
                 self.primary_key,
                 self.table
             );
         }
         if self.snapshot_batch_size == 0 {
             bail!(
-                "snapshot_batch_size doit etre superieur a 0 pour {}",
+                "snapshot_batch_size must be greater than 0 for {}",
                 self.table
             );
         }
         let mut seen_fields = BTreeSet::new();
         for field in &self.fields {
             if field.trim().is_empty() {
-                bail!("nom de champ vide dans {}", self.table);
+                bail!("empty field name in {}", self.table);
             }
             if !seen_fields.insert(field) {
-                bail!("champ duplique dans {}: {}", self.table, field);
+                bail!("duplicate field in {}: {}", self.table, field);
             }
         }
         for field in &self.watch_fields {
             if field.trim().is_empty() {
-                bail!("nom de watch_field vide dans {}", self.table);
+                bail!("empty watch_field name in {}", self.table);
             }
         }
         self.validate_attribute_list("displayed_attributes", self.displayed_attributes.as_deref())?;
@@ -239,7 +327,7 @@ impl TableConfig {
         for attribute in attributes {
             if !seen_attributes.insert(attribute) {
                 bail!(
-                    "attribut duplique dans {} pour {}: {}",
+                    "duplicate attribute in {} for {}: {}",
                     label,
                     self.table,
                     attribute
@@ -256,7 +344,7 @@ impl TableConfig {
         };
         for value in values {
             if value.trim().is_empty() {
-                bail!("valeur vide dans {} pour {}", label, self.table);
+                bail!("empty value in {} for {}", label, self.table);
             }
         }
         Ok(())
@@ -274,7 +362,7 @@ impl TableConfig {
             return Ok(());
         }
         bail!(
-            "attribut '{}' dans {} pour {} absent des champs du document",
+            "attribute '{}' in {} for {} is missing from document fields",
             attribute,
             label,
             self.table
@@ -301,6 +389,7 @@ mod tests {
             mysql: MysqlConfig {
                 url: "mysql://user:password@localhost/shop".to_owned(),
                 server_id: 42,
+                allow_insecure: false,
             },
             meilisearch: MeilisearchConfig {
                 host: "http://localhost:7700".to_owned(),
@@ -383,7 +472,7 @@ mod tests {
             .validate()
             .expect_err("attribute should be rejected when the source name is aliased");
 
-        assert!(error.to_string().contains("absent des champs du document"));
+        assert!(error.to_string().contains("missing from document fields"));
     }
 
     #[test]
@@ -395,7 +484,7 @@ mod tests {
             .validate()
             .expect_err("primary key must be part of fields");
 
-        assert!(error.to_string().contains("doit etre presente"));
+        assert!(error.to_string().contains("must be included"));
     }
 
     #[test]
@@ -407,6 +496,51 @@ mod tests {
             .validate()
             .expect_err("duplicate table/index mapping should be rejected");
 
-        assert!(error.to_string().contains("table dupliquee"));
+        assert!(error.to_string().contains("duplicate table"));
+    }
+
+    #[test]
+    fn validate_rejects_unencrypted_remote_mysql() {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.mysql.url = "mysql://user:password@database.example/shop".to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("remote MySQL without TLS should be rejected");
+
+        assert!(error.to_string().contains("require_ssl=true"));
+    }
+
+    #[test]
+    fn validate_rejects_unencrypted_remote_meilisearch() {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.meilisearch.host = "http://search.example:7700".to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("remote Meilisearch without TLS should be rejected");
+
+        assert!(error.to_string().contains("must use HTTPS"));
+    }
+
+    #[test]
+    fn validate_accepts_encrypted_remote_services() -> Result<()> {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.mysql.url =
+            "mysql://user:password@database.example/shop?require_ssl=true".to_owned();
+        config.meilisearch.host = "https://search.example:7700".to_owned();
+
+        config.validate()
+    }
+
+    #[test]
+    fn validate_requires_explicit_override_for_insecure_private_networks() -> Result<()> {
+        let mut config = config_with_tables(vec![valid_table()]);
+        config.mysql.url = "mysql://user:password@mysql/shop".to_owned();
+        config.mysql.allow_insecure = true;
+        config.meilisearch.host = "http://meilisearch:7700".to_owned();
+        config.meilisearch.allow_insecure = true;
+
+        config.validate()
     }
 }

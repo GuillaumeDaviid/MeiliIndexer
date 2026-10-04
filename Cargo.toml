@@ -2,7 +2,7 @@
 name = "meili-mysql-sync"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1.0"
@@ -11,17 +11,24 @@ futures-util = "0.3"
 meilisearch-sdk = { version = "0.33", default-features = false, features = [
     "reqwest",
     "tls",
-    "jwt_rust_crypto",
 ] }
-mysql_async = { version = "0.37", features = ["binlog", "tracing"] }
+mysql_async = { version = "0.37.1", features = [
+    "binlog",
+    "ring",
+    "rustls-tls",
+    "tls12",
+    "tracing",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sysinfo = "0.33"
+tempfile = "3.23"
 tokio = { version = "1.45", features = ["macros", "rt-multi-thread", "signal", "time"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["v7"] }
+url = "2.5"
 
 [lints.rust]
 unsafe_code = "warn"
